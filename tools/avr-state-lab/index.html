@@ -1,0 +1,154 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>AVR State Lab</title>
+  <style>
+    :root { color-scheme: light dark; font: 16px/1.5 system-ui, sans-serif; }
+    body { max-width: 760px; margin: 2rem auto; padding: 0 1rem; }
+    h1 { margin-bottom: .15rem; }
+    .subtle { color: #777; }
+    .card { border: 1px solid #8886; border-radius: 12px; padding: 1rem; margin: 1rem 0; }
+    .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)); gap: .75rem; }
+    button, select, input { font: inherit; padding: .55rem .7rem; border-radius: 7px; }
+    button { cursor: pointer; margin: .2rem; }
+    .state { font-size: 1.15rem; }
+    .warning { border-left: 4px solid #d99a00; padding-left: .75rem; }
+    #message { min-height: 1.5em; color: #b33; }
+    li { margin: .25rem 0; }
+    code { overflow-wrap: anywhere; }
+  </style>
+</head>
+<body>
+  <h1>AVR State Lab</h1>
+  <p class="subtle">Local simulator for testing persistent Home Assistant-style state.</p>
+  <p class="warning"><strong>Simulator only:</strong> actions update the saved mirror; no commands are sent to your receiver. State is assumed, not read back from hardware.</p>
+
+  <section class="card" aria-live="polite">
+    <h2>Persisted state <small id="confidence"></small></h2>
+    <div class="grid">
+      <div class="state">Power: <strong id="power">—</strong></div>
+      <div class="state">Source: <strong id="source">—</strong></div>
+      <div class="state">Volume: <strong id="volume">—</strong></div>
+      <div class="state">Muted: <strong id="muted">—</strong></div>
+    </div>
+    <p class="subtle">Last command: <span id="updated">never</span></p>
+  </section>
+
+  <div class="grid">
+    <section class="card">
+      <h2>Power</h2>
+      <button data-action="power_on">On</button>
+      <button data-action="power_off">Off</button>
+      <button data-action="power_toggle">Toggle</button>
+    </section>
+
+    <section class="card">
+      <h2>Source</h2>
+      <select id="source-choice" aria-label="Source">
+        <option value="cable_sat">Cable/Sat</option>
+        <option value="game">Game</option>
+        <option value="media_server">Media Server</option>
+        <option value="network">Network</option>
+        <option value="radio">Radio</option>
+        <option value="tv">TV</option>
+      </select>
+      <button id="set-source">Select source</button>
+    </section>
+
+    <section class="card">
+      <h2>Volume (simulated dB)</h2>
+      <label for="volume-choice">Set level (-80 to 10):</label>
+      <input id="volume-choice" type="number" min="-80" max="10" step="0.5" value="-30">
+      <button id="set-volume">Set volume</button>
+      <button data-action="volume_down">Down</button>
+      <button data-action="volume_up">Up</button>
+    </section>
+
+    <section class="card">
+      <h2>Mute</h2>
+      <button data-action="mute_on">Mute</button>
+      <button data-action="mute_off">Unmute</button>
+      <button data-action="mute_toggle">Toggle</button>
+    </section>
+  </div>
+
+  <section class="card">
+    <h2>Recent commands</h2>
+    <ol id="history"><li>No commands yet.</li></ol>
+    <button id="reset">Reset to unknown</button>
+  </section>
+  <p id="message" role="status"></p>
+
+  <script>
+    const sourceNames = {
+      cable_sat: "Cable/Sat", game: "Game", media_server: "Media Server",
+      network: "Network", radio: "Radio", tv: "TV"
+    };
+
+    async function send(command) {
+      const response = await fetch("/api/command", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(command)
+      });
+      const body = await response.json();
+      if (!response.ok) throw new Error(body.error || "Request failed.");
+      render(body);
+      document.querySelector("#message").textContent = "Saved locally.";
+    }
+
+    async function refresh() {
+      const response = await fetch("/api/state", { cache: "no-store" });
+      const body = await response.json();
+      if (!response.ok) throw new Error(body.error || "Could not load state.");
+      render(body);
+    }
+
+    function render(state) {
+      document.querySelector("#confidence").textContent = `(${state.confidence})`;
+      document.querySelector("#power").textContent = state.power;
+      document.querySelector("#source").textContent =
+        state.source ? sourceNames[state.source] || state.source : "unknown";
+      document.querySelector("#volume").textContent =
+        state.volume === null ? "unknown" : `${state.volume} dB`;
+      document.querySelector("#muted").textContent =
+        state.muted === null ? "unknown" : state.muted ? "yes" : "no";
+      document.querySelector("#updated").textContent = state.updated_at || "never";
+      const history = document.querySelector("#history");
+      history.replaceChildren();
+      if (!state.history.length) {
+        const item = document.createElement("li");
+        item.textContent = "No commands yet.";
+        history.append(item);
+        return;
+      }
+      for (const entry of [...state.history].reverse()) {
+        const item = document.createElement("li");
+        item.textContent = `${entry.at}: ${entry.action}` +
+          (entry.value === undefined ? "" : ` (${entry.value})`);
+        history.append(item);
+      }
+    }
+
+    function reportError(error) {
+      document.querySelector("#message").textContent = error.message;
+    }
+
+    document.querySelectorAll("[data-action]").forEach(button => {
+      button.addEventListener("click", () =>
+        send({ action: button.dataset.action }).catch(reportError));
+    });
+    document.querySelector("#set-source").addEventListener("click", () =>
+      send({ action: "source", value: document.querySelector("#source-choice").value })
+        .catch(reportError));
+    document.querySelector("#set-volume").addEventListener("click", () =>
+      send({ action: "volume_set", value: Number(document.querySelector("#volume-choice").value) })
+        .catch(reportError));
+    document.querySelector("#reset").addEventListener("click", () =>
+      send({ action: "reset" }).catch(reportError));
+    refresh().catch(reportError);
+  </script>
+</body>
+</html>

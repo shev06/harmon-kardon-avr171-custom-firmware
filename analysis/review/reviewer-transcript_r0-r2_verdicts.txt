@@ -1,0 +1,278 @@
+Agent is still running. agent_id: 37f7ec42-9efc-4b38-984d-e1e13f98d154, agent_type: rubber-duck, status: running, description: Review CEC sleep firmware patch, elapsed: 41825s, total_turns: 3, tool_calls_completed: 536. Keep using this agent_id; do not call list_agents to rediscover it. Consider telling the user you're waiting, then end your response with no further tool calls. A completion notification will arrive as a new turn; no need to poll or redo its work.
+
+Completed turns:
+[Turn 0]
+## Verdict: **FIX FIRST**
+
+The clean-state patch works, but it is not safe against valid state combinations: CEC can still cause deep shutdown or ignore the command.
+
+### Blocking Issues
+
+1. **Stale `0x2001c038` bit 7 still causes deep shutdown**  
+   **Impact:** CEC `<Standby>` and power-toggle can reach the deep variant despite the new blocks.  
+   **Evidence:**
+   - `/tmp/decomp-core.log:198–212`: `FUN_080192e2` arms `c2b6=100` / `bfd8=0xe10` without clearing `c038` when `bfb8 < 100`.
+   - `/tmp/decomp-12f6c.log:204–208`: `FUN_08019638` chooses `bfb8=300` iff `c038 bit7` is set; otherwise `250`.
+   - At sequencer state `0xaf`, `/tmp/decomp-seq.txt:245–328` tests `DAT_08014eb8`; literal slot `0x08014eb8 = 0x2001c038`. Set takes the deep body (`c09c |= 0x40`, `c2ab=7`); clear takes normal (`c03c |= 3`, `c27f=0`).
+   - Independent Unicorn result on `/tmp/avrwork/candidate.fw`, with only `c038=0x80` injected:
+     - CEC case `4`: `deep=True`, `c09c=64`, `c2ab=7`.
+     - CEC case `0x20`: identical deep result.
+   - `/tmp/avrwork/fuzz.py` does **not** test deep detection for `marker_stale`; its `deep()` assertion is gated on `mode == 'marker_clear'`. Its stale-marker equivalence is only equivalence to the stock network path, which has the same vulnerability.
+   
+   **Fix:** Route every CEC-originated power-off path through a wrapper that clears `c038 bit7` before arming normal sleep, while not overriding an already-active intentional deep shutdown. This must cover both new case-4/`0x20` blocks, the existing Zone-2-true calls at `0x0802d33c` / `0x0802d3d4`, and the cave callback path below.
+
+2. **CEC standby can be dropped while `bfb8 >= 100`**  
+   **Impact:** Receiver can remain on rather than sleep.  
+   **Evidence:**
+   - `FUN_080192e2` only arms normal sleep when `bfb8 < 100`; otherwise, with `c050 bit3` clear, it merely clears `c038` and returns.
+   - `/tmp/decomp-12f6c.log:357`: `FUN_08019378` sets `bfb8=200` during power-on/wake, so this is not limited to an exceptional shutdown state.
+   - Emulator with candidate, `bfb8=200`, CEC case 4, then 520 ticks: final `c030=2`, `b2b6=0`, `bfd8=0`; it stayed on.
+   
+   **Fix:** Latch/defer the CEC sleep request until `bfb8 < 100` rather than calling `FUN_080192e2` once and discarding it.
+
+### Non-Blocking Findings
+
+1. **Root-cause model is locally correct, but incomplete temporally.**  
+   At `0x080144dc`, the sequencer tests only `0x2001c038 bit7`; clear branches to normal code at `0x080147ec`, set enters deep code. Literal mappings confirm:
+   - `0x08014eb8 -> 0x2001c038`
+   - `0x08014a68 -> 0x2001c09c`
+   - `0x08014ec4 -> 0x2001c2ab`
+   - `0x08014ec8 -> 0x2001c27f`
+   - `0x08014cb0 -> 0x2001c03c`
+   
+   However, patched CEC calls `FUN_080192e2`, which arms `bfd8`. `/tmp/decomp-mainloop.log:145–148` shows that expiry of `bfd8` later sets `c038 bit7`, clears `c03c bit1`, and starts `c2b5=100`. The ticker then reaches `FUN_08019638`. This is inherited from the button/network route, but it means normal sleep may eventually become deep sleep if that timer runs while asleep. If indefinite HA reachability is required, this needs a separate policy fix/test.
+
+2. **Direct CEC reachability is otherwise well-contained.**  
+   - All direct dispatcher calls passing `4` or `0x20` are:
+     - `0x0804c554` (`FUN_0804c39c`) → `4`
+     - `0x0804bfaa` (`FUN_0804bea4`) → `0x20`
+     - `0x0804bfb2` (`FUN_0804bea4`) → `4`
+   - Other callers pass `1,2,3,5,6,7,0x21`, etc.
+   - The CEC parser/control ranges contain no `blx`, computed branch, `tbb`, or `tbh`.
+   - The `c038` scan finds the expected setters only; aside from the two replaced dispatcher blocks, they are in main-loop, auto-power-off, Zone-2, front-panel/IR, and boot code. No direct CEC-handler writes to `bfb8`, `c09c`, or `c2ab` were found.
+
+3. **Correction: the `FUN_0809b3fc` callback is “likely dead,” not proven dead.**  
+   I independently confirmed:
+   - `0x0809b554` calls `0x0809b3fc` at `0x0809b5c2` / `0x0809b5d8`.
+   - `0x0808c938` loads literal slot `0x0808ca64 = 0x0809b555` and registers it through `FUN_0808cbc2`.
+   - `FUN_0808cbc2` writes the callback pointer at `+0x1f8` and flag at `+0x1f4`.
+   - There are 132 literal-load sites in exactly 31 functions using `0x2000be2c`; none has a non-return indirect transfer.
+   
+   If it is live, candidate code at `0x0809b44a` branches to `0x080c8a0e`, which executes:
+   - `bl 0x0808c9c8`
+   - `bl 0x080192e2`
+   - `b.w 0x0809b44e`
+   
+   `FUN_0808c9c8` only writes `0x2001a936`; it does not touch the shutdown globals. Therefore a live callback has **no unique new deep path**, but it inherits both blockers above: stale marker can deep-shutdown; `bfb8>=100` can no-op.
+
+4. **Machine-code edits are structurally correct.**  
+   - `0x0802d302`: `eb f7 ee ff` → `bl 0x080192e2`; followed by exactly 18 `00 bf` NOPs.
+   - `0x0802d39a`: `eb f7 a2 ff` → `bl 0x080192e2`; followed by exactly 18 NOPs.
+   - Preserved `0x0802d32a` branches to `0x0802d356`; preserved `0x0802d3c2` branches to `0x0802d3ee`.
+   - Both joins immediately set `r5=1`; later code reloads volatile registers. `FUN_0802d230` saves/restores LR (`push {r3,r4,r5,lr}` / `pop {...,pc}`), and `FUN_080192e2` preserves stack/callee-saved registers.
+   - `0x080c8a1a..0x080c8a35` is all `FF`. No candidate `bl`/`b.w`, little-endian literal, or `movw`/`movt` construction references `0x080c8a1a` or `0x080c8a1b`.
+
+5. **Diff is clean.**  
+   - `/tmp/avrwork/candidate.fw` exactly equals the guarded in-memory build from `/Users/allisonbulner/AVR1710_USB(V002_23)_patched.fw`.
+   - Versus pristine: 999 changed bytes in 18 runs, all within the stated allowed regions; no extras.
+   - Restored calls exactly match pristine:
+     - `0x08019294 = 00f0d0f9`
+     - `0x0801930e = 00f093f9`
+     - `0x08019348 = 00f076f9`
+   - The expected retained changes are present: query redirect, two volmute redirects, WFI/WFE NOPs, dead CEC redirects, version byte, cave, and the two new dispatcher blocks.
+
+### Cheapest Live Checks, Ranked
+
+1. **Busy-state lost standby:** power on/wake AVR, then send TV standby immediately. Report whether AVR stays on.  
+2. **Stale-marker deep path:** after any interrupted/failed shutdown sequence, send CEC standby and report LED state plus HA reachability. Red-only plus unreachable HA confirms it.  
+3. **Normal-sleep timeout:** leave it CEC-asleep while polling HA; report time to loss of connectivity.  
+4. **Zone 2/race:** repeat CEC standby with Zone 2 on and while toggling Zone 2; report whether HA remains reachable.  
+5. **Possible callback:** send a broadcast `<Standby>` and report whether it creates one normal sleep, a duplicate/restarted countdown, or deep shutdown.
+
+The clean-state baseline is good: candidate CEC case 4/`0x20` reached the normal 53-GPIO-write state and matched stock button/network RAM state. The state-dependent failures above prevent a **SAFE TO FLASH** verdict.
+
+[Turn 1]
+[Message]
+RE-REVIEW REQUEST: Option 4b (redesign after your FIX FIRST on Option 4 with 2 blockers).
+
+Read /tmp/avrwork/REVIEW_PACK_4b.txt FIRST - it is self-contained (files, the 2 blockers and how 4b closes them, the 185-byte diff, the helper source/bytes, all evidence incl. test4b.py 0-failure results, fresh-Ghidra verification log, caller audit, newly resolved timing facts, known limits, and exactly what I want from you). Do not trust the pack: re-derive from the files. Candidate = /tmp/avrwork/candidate4b.fw ; helper source = /tmp/avrwork/cec_sleep_helper.S ; suite = /tmp/avrwork/test4b.py ; fresh-Ghidra evidence = /tmp/fresh-candidate4b.log ; builder = /tmp/avrwork/build_candidate_4b.py. Pristine = /Users/allisonbulner/AVR1710_USB(V002_23).fw ; deliverable (NOT modified) = /Users/allisonbulner/AVR1710_USB(V002_23)_patched.fw.
+
+Please do NOT modify anything except scratch files under /tmp/review/. A wider rerun (test4b.py ... 60 98765) is still running and will write /tmp/avrwork/test4b_run3.log when it finishes (it buffers until done); don't wait for it.
+
+Give a VERDICT: CLEAN or FIX FIRST. For each blocker: concrete evidence (addresses, bytes, log lines) and the minimal fix. Specifically attack: (1) both old blockers truly closed; (2) any remaining CEC path to deep/stall/lost request/wedge (standby during fresh wake bfb8 in [100,300), during the 2 s fade, during an already-running c2b5, while OFF/sequencer running, Zone 2 states, repeated/broadcast <Standby>); (3) machine-code review of the 185-byte diff (bl encodings, NOP sleds, join points 0x0802d32a->0x0802d356 and 0x0802d3c2->0x0802d3ee, regs live across the replaced blocks, helper register/stack use, literal alignment, nothing referencing the erased 0x080c8a1a trampoline); (4) whether the oracle in test4b.py is circular or masks a divergence (my two oracle-artifact explanations: 'W c038' events and the single extra ('W','b2b5',100) in the deferred class); (5) sanity-check the new timing derivation in section F (TIM2 clock 60 MHz, 10 kHz tick, CC2=1 ms, CC3=10 ms, c030-bit0 slow tick = 1 s, bfd8=3600 => 1 hour; FUN_08011910 ~20 ms so c2b5/c2b6=100 => ~2 s); (6) what ELSE could fail on real hardware and the single live check that would settle it.
+
+[Response]
+## Verdict: **FIX FIRST**
+
+### Blocking Issues
+
+1. **Active countdowns can cause a reachable double shutdown entry**
+   - Helper `0x080c8d58` clears `c038 bit7`, then:
+     - `bfb8 >= 100` → writes only `c2b5=100` (`0x080c8d7a..7e`);
+     - otherwise calls `FUN_080192e2`, which arms `c2b6=100`.
+   - It neither clears nor handles an existing `c2b5`/`c2b6`.
+   - `FUN_08011910` independently expires both:
+     - `c2b5` at `0x0801198c..d4` sets `c050 bit3` and reaches `FUN_08019638`;
+     - `c2b6` at `0x080119fc..0x08011a1e` directly calls `FUN_08019638`.
+   - `FUN_08019638` has no “already shutting down” guard and rewrites `bfb8` at `0x08019a3e..58`.
+
+   **Reachable candidate trace (real core code in Unicorn):**
+   1. Start OFF; `FUN_08019272` begins normal wake: `bfb8=200`.
+   2. At tick 50, CEC Standby: `bfb8=150`, helper defers with `c2b5=100`.
+   3. At tick 110, a second Standby: `bfb8=90`, `c2b5=40`; helper takes the direct path and sets `c2b6=100`.
+   4. `FUN_08019638` runs at tick 150 (`bfb8=250`) and again at tick 210 (`bfb8=250`).
+
+   Both entries were normal in emulation (`c038=0`, `c03c=3`), but the second re-enters a large unguarded hardware shutdown routine after the first has started. The emulator stubs its external side effects, so it cannot establish that this is harmless on hardware.
+
+   **Minimal fix:** while ON, after clearing `c038 bit7`, explicitly clear both `0x2001c2b5` and `0x2001c2b6`, then schedule exactly one path:
+   - busy wake: set only `c2b5=100`;
+   - otherwise: call `FUN_080192e2` (which creates the sole `c2b6` countdown).
+   
+   Add a literal for `0x2001c2b6`; the free cave after `0x080c8d94` has room. Retest nonzero combinations of both counters plus repeated CEC during the deferred window.
+
+### Non-Blocking Issues
+
+1. **Deferred CEC does not match button-path one-hour behavior**
+   - Direct CEC/button path ends with `bfd8=3600`.
+   - Deferred CEC (`bfb8=150`) ends with `bfd8=0`.
+   - This is static: the deferred route reaches `FUN_080192e2` with `c050 bit3` set, so it takes restored `0x0801930e -> FUN_08019638` instead of `0x08019314..24`, where `bfd8=0xe10` is armed.
+
+   Impact: deferred CEC sleep will not later transition to the stock one-hour deep state. This may be desirable, but it contradicts the stated “button and CEC alike” timing model. Decide policy explicitly; if button parity is required, arm `bfd8=0xe10` in the deferred branch.
+
+2. **`test4b.py` misses the blocker and overstates its marker check**
+   - `/tmp/avrwork/test4b.py:86`, `:127`, and `:178` explicitly initialize both `b2b5` and `b2b6` to zero.
+   - `/tmp/avrwork/test4b.py:153-156` discards all `W c038` events. There is no explicit final `c038 bit7 == 0` assertion; only the non-force differential RAM comparison incidentally checks final RAM.
+   - The deferred reference manually inserts `c2b5=100`; that is reasonable as a model of the intended policy, but it is partially circular and cannot validate timer interaction/repeated requests.
+
+   Add tests for `c2b5,c2b6 ∈ {0,1,50,100}`, simultaneous counters, and the wake → deferred Standby → second Standby sequence. Assert exactly one `bfb8=250/300` entry.
+
+### Verified / No Issue Found
+
+- **Original blockers in isolation are closed.**
+  - Helper bytes at `0x080c8d58` correctly test `c030 bit1`, clear `c038 bit7` only while ON, and defer busy requests.
+  - A real deep entry through `FUN_08019638` immediately leaves `c030=0`, `bfb8=300`; helper then returns without modifying the marker.
+  - A real wake through `FUN_08019272` produces `c030=2`, `bfb8=200`; a single CEC request at tested wake phases reached normal sleep.
+
+- **Machine code is mechanically sound.**
+  - Helper calls:
+    - `0x0802d302: 9bf029fd`
+    - `0x0802d33c: 9bf00cfd`
+    - `0x0802d39a: 9bf0ddfc`
+    - `0x0802d3d4: 9bf0c0fc`
+    - `0x080c8a12: 00f0a1f9`
+    all decode to `0x080c8d58`.
+  - Helper internal `50f7b5fa` resolves to `FUN_080192e2`.
+  - Both replaced blocks retain 18 NOPs and their original joins:
+    `0x0802d32a -> 0x0802d356`, `0x0802d3c2 -> 0x0802d3ee`.
+  - `FUN_0802d230` saves LR/r4/r5; helper preserves r4/LR and maintains 8-byte stack alignment. Joins overwrite volatile state before use.
+  - Literal pool is correctly aligned at `0x080c8d84`: `c030`, `c038`, `bfb8`, `c2b5`.
+  - Old trampoline `0x080c8a1a..35` is all `FF`; no branch, literal, or complete MOVW/MOVT construction references it.
+
+- **Diff integrity checks passed.**
+  - Candidate SHA-256: `421fbbb28d983489263ec7f29b9ef5e15d18ee0f5e46c4814830ec6a3b10b093`.
+  - Candidate equals the guarded in-memory builder result.
+  - Deliverable → candidate: exactly 185 changed bytes in 17 ranges.
+  - Restored calls at `0x08019294`, `0x0801930e`, `0x08019348` are pristine bytes:
+    `00f0d0f9`, `00f093f9`, `00f076f9`.
+
+- **Timing derivation is sound nominally.**
+  - PLL value `0x05403c19` gives HSE 25 MHz, M=25/N=240/P=2 → 120 MHz.
+  - `0x0808bc40` sets APB1 `/4`; TIM2 receives 60 MHz.
+  - `PSC=0x176f` at `0x08065d4c` gives 10 kHz; initialized increments are 1/10/100.
+  - Thus `FUN_08011910` is approximately every 20 ms, and 100 countdown units are approximately two seconds. Cooperative-loop jitter remains possible.
+
+### Suggested live checks after the countdown fix
+
+1. **Highest priority:** wake the AVR, send Standby about 1 second into wake, then repeat it about 1.2 seconds later. Report display/LED and HA/network reachability at +3 s and +5 s. This directly exercises the current blocker.
+2. **Zone 2:** enable Zone 2, send directed and broadcast Standby, then report main/Zone-2 audio, LED state, and Ethernet/HA availability after 3–10 s.
+3. **Timer-policy decision:** use the deferred-wake route and verify whether the AVR remains network-reachable beyond ~61 minutes. This distinguishes the current `bfd8=0` behavior from button parity.
+
+No firmware files were modified.
+
+[Turn 2]
+[Message]
+Re-review request: Option 4b r2 (your FIX FIRST blocker: overlapping c2b5/c2b6 countdowns -> FUN_08019638 entered twice at ticks 150 and 210).
+
+Read /tmp/avrwork/REVIEW_PACK_4b_r2.txt (a delta pack; it points to REVIEW_PACK_4b.txt for the root-cause model and stock semantics). Do NOT trust the pack: re-derive from the files. Modify nothing except scratch under /tmp/review/.
+
+Key facts to verify yourself:
+- Candidate: /tmp/avrwork/candidate4b.fw sha256 33e62c4ac32709edc6af869680be19f34ac4c7b55f6b4fd8d75d6317e06c5f99 (the old 421fbbb2... file no longer exists). Helper is now 64 bytes at 0x080c8d58..0x080c8d97: if(!(c030&2)) return; c038&=0x7f; b=bfb8; c2b5=0; c2b6=0; if(b>=100){c2b5=100;return;} FUN_080192e2();
+- Disassembly of the helper is in the pack; please independently decode the bytes from the candidate file (literal offsets, strb [r4,#1] -> c2b6, bcs/bpl targets, bl encoding, pool alignment).
+- Tests: python -u /tmp/avrwork/test4b.py /tmp/avrwork/candidate4b.fw 25 1234 -> TOTAL FAILURES 0 (log test4b_run5_n25.log); N=60/seed 98765 -> 0 (test4b_run5_n60.log). Negative control (negctl.py, log negctl_final.log) fails on the old helper: 5a 639/768, 5b = your trace (2 entries), 5c 7/400.
+- Fresh-Ghidra import of the r2 candidate: /tmp/fresh-candidate4b-v2.log. Applier dry run passes (/tmp/apply_cec_sleep_fix_4b.py, no --apply).
+- Optional patch O1 (separate, 1 byte at 0x08010a57, d1->e0, turning bne 0x08010a80 at 0x08010a56 into b 0x08010a80 to skip the 1-hour bfd8 sleep->deep expiry): /tmp/avrwork/candidate4c.fw (sha bd9339a6...850f), /tmp/avrwork/test_o1.py. Please review it as well and say whether you would ship it.
+
+Please return: VERDICT (CLEAN / FIX FIRST with each blocker + concrete evidence), confirm the double-entry blocker is closed for ANY two-countdown interleaving (c2b5/c2b6 pending x Standby at any phase, incl. c2b6<=25 where FUN_08060c64 already ran, Zone 2 on/off), machine-code review of the helper, oracle-independence review of test4b.py sections 5a/5c/3, the O1 review, anything else that can still go deep/stall/lose the request/wedge, and the single live check that would settle it. Concrete evidence (addresses, bytes, logs), not speculation.
+
+[Response]
+## Verdict: **FIX FIRST**
+
+The r2 helper closes the two prior blockers on the normal CEC dispatcher path, but I cannot call the image clean while the added `FUN_0809b3fc` callback is “likely dead, not proven dead.”
+
+### Blocking issue — live callback can still reach deep shutdown
+**Impact:** If the callback is live and Auto Power Off’s bit-2 condition is active, a broadcast `<Standby>` can still produce deep shutdown and two overlapping transitions.
+
+**Evidence**
+- Callback hook:
+  - `0x0809b44a: bl 0x080c8a0e`
+  - Cave: `0x080c8a0e: bl 0x0808c9c8; 0x080c8a12: bl 0x080c8d58; 0x080c8a16: b.w 0x0809b44e`
+- Unlike normal `FUN_0802d230`, this path does **not** execute the common tail:
+  - `*(uint16_t *)0x2001c15e = *(uint16_t *)0x2001c0b0`
+  - `*(uint16_t *)0x2001c160 = 0x708`
+- `FUN_08012c88` tests `0x2001c050` bit 2 at `0x08012cd0` / `0x08012d26`, sets `c038[7]` at `0x08012cd8..e2` or `0x08012d2e..38`, then calls `FUN_080192e2`.
+- Reproduced helper-only/callback-equivalent state: ON, `c050=0x04`, `c160=1`. After helper then `FUN_08012c88`:
+  - helper: `c038=0`, `c2b6=100`
+  - shutdown writes: `[(100, 300), (150, 250)]`
+  - sequencer result: `c09c=0x40`, `c2ab=7` → **deep**.
+- With `c050=0`, the same test yields one normal `bfb8=250` transition. So this is configuration-dependent, but real if Auto Power Off can be enabled.
+
+**Minimal fix:** In the callback cave, after the helper and before branching to `0x0809b44e`, reproduce the dispatcher’s timer reset:
+```c
+*(uint16_t *)0x2001c15e = *(uint16_t *)0x2001c0b0;
+*(uint16_t *)0x2001c160 = 0x708;
+```
+This fits in the erased `0x080c8a1a..35` space using `c15e + 2` for `c160`. Alternatively, prove the callback table has no consumer and remove the hook. Add a regression that exercises the full callback path with `c050=4`, `c160=1`, and the slow-tick scheduler.
+
+## Confirmed good
+
+- **Original double-countdown blocker is closed.** Helper at `0x080c8d58`:
+  - clears deep marker: `0x080c8d66..6a`, `& 0x7f`;
+  - clears both counters: `0x080c8d74 strb [r4]`, `0x080c8d76 strb [r4,#1]`;
+  - chooses exactly one path: `bhs 0x080c8d82` for `bfb8 >= 100`, else `bl 0x080192e2`.
+- Literal pool is aligned at `0x080c8d88`: `c030`, `c038`, `bfb8`, `c2b5`. Stack use is sound: `push/pop {r4,lr}`.
+- The prior overlap tests pass: section 5a is `768 / 0`; reviewer trace produces exactly one entry at tick 210; random sequences are `480 / 0`. The r1 negative control fails these tests.
+- I also tested existing `c2b6 = 24, 25, 26`; repeated Standby produces one normal shutdown, no deep, for Zone 2 on and off.
+- **Standard dispatcher Auto Power Off race is not a blocker.** Candidate `FUN_0802d230` always executes the `c15e/c160` reset tail for live ON cases 4 and `0x20`. A direct run changed `c160` from `1` to `0x0708` after CEC, far outside the ~2-second fade window.
+- Zone-2 matrix in `test4b_run5_n60.log` passes stale/clean marker and `bfb8 < / >= 100` cases.
+
+## Binary integrity
+
+- Candidate SHA-256 matches the claimed r2 image:  
+  `33e62c4ac32709edc6af869680be19f34ac4c7b55f6b4fd8d75d6317e06c5f99`
+- Dry verifier passes:
+  - 189 changed bytes vs deliverable, all approved;
+  - 1,071 differences vs pristine, all within 13 approved ranges;
+  - no branch/literal references into erased `0x080c8a1a..35`;
+  - restored calls match pristine.
+- Patched calls decode correctly:
+  - `0x0802d302: 9b f0 29 fd -> 0x080c8d58`
+  - `0x0802d39a: 9b f0 dd fc -> 0x080c8d58`
+  - companion calls at `0x0802d33c`, `0x0802d3d4` also target helper.
+- The 18-NOP sleds preserve joins `0x0802d32a -> 0x0802d356` and `0x0802d3c2 -> 0x0802d3ee`; those joins immediately overwrite `r0`/`r5`, so removed state is not live.
+
+## Test-oracle assessment
+
+**Non-blocking limitation:** Sections 5a/5b/5c are meaningful, and the negative control validates them. But differential section 3 is not a full independent equivalence oracle: it pre-clears the reference marker, injects deferred `c2b5=100`, removes helper-specific events, suppresses `c038` events, and zeros `c15e/c160` before RAM comparison. It cannot catch the callback/Auto-Power-Off case.
+
+## O1 (`candidate4c`)
+
+Technically correct:
+- exactly one byte at `0x08010a57`: `13 d1` → `13 e0`;
+- both branches target `0x08010a80`;
+- `test_o1.py` passes all checks.
+
+I would **not ship O1 by default**: it globally disables the stock one-hour sleep→deep policy. Ship it only if indefinite HA reachability is an explicit requirement, after a 65+ minute physical soak. Without O1, base r2 will still follow stock `bfd8=3600` expiry.
+
+## Cheapest decisive live check
+
+Enable/arm Auto Power Off, arrange expiry immediately after a **broadcast** `<Standby>`, then check front-panel state and HA/Ethernet reachability at +5 seconds. Deep/inaccessible behavior proves the callback is live and exposes the blocker; normal reachable sleep substantially supports the callback-dead/config-disabled assumption.

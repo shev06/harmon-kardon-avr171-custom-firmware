@@ -1,0 +1,126 @@
+REVIEW PACK 3 - AVR1710 "Option 4b" r2 (countdown-overlap fix).   Delta pack: read REVIEW_PACK_4b.txt for the root-cause model and the stock function semantics.
+===========================================================================================================================================================
+
+You returned FIX FIRST on 4b with ONE blocker (overlapping c2b5/c2b6 countdowns -> FUN_08019638 entered twice, ticks 150 and 210).
+This pack is the fix.  Please re-review from the files (do not trust this pack).  Modify nothing except scratch files under /tmp/review/.
+
+FILES
+  pristine                  /Users/allisonbulner/AVR1710_USB(V002_23).fw                 sha256 396f14e3...df34b
+  deliverable (UNTOUCHED)   /Users/allisonbulner/AVR1710_USB(V002_23)_patched.fw         sha256 a39f47f2...4898e   (patch #4 + volmute)
+  candidate 4b (r2)         /tmp/avrwork/candidate4b.fw                                  sha256 33e62c4ac32709edc6af869680be19f34ac4c7b55f6b4fd8d75d6317e06c5f99
+                            (the r1 candidate, sha 421fbbb2..., no longer exists; the file was rebuilt)
+  builder                   /tmp/avrwork/build_candidate_4b.py     helper source /tmp/avrwork/cec_sleep_helper.S (+ .elf/.bin)
+  test suite                /tmp/avrwork/test4b.py  (python = /tmp/avrenv/bin/python ; usage: test4b.py <fw> <N> <seed>)
+  negative control          /tmp/avrwork/negctl.py  (builds candidate4b_prefix.fw = r1 helper; the NEW tests must FAIL on it)   log negctl_final.log
+  full-run logs             /tmp/avrwork/test4b_run5_n25.log (seed 1234), test4b_run5_n60.log (seed 98765)
+  fresh-Ghidra verification /tmp/fresh-candidate4b-v2.log  (fresh import of the r2 candidate, script AVRCecSleep4bVerify.java)
+  applier                   /tmp/apply_cec_sleep_fix_4b.py  (dry-run by default; --apply writes with backup + post-verify; DRY RUN PASSES for r2)
+  OPTIONAL O1 (separate)    /tmp/avrwork/candidate4c.fw (= 4b + 2-byte O1), build_candidate_4c.py, test_o1.py     sha256 bd9339a6b7f69d2486cc7f60b6b1f92b5aade6e5cb28d2c17e1c6ec23a53850f
+
+WHAT CHANGED vs r1 (only the helper; the 5 call sites, the 3 restores, the 2 NOP-sled blocks and the erased trampoline are byte-identical to r1)
+  r1 (60 B):  if(!(c030&2)) return; c038&=0x7f; if(bfb8>=100){c2b5=100; return;} FUN_080192e2();
+  r2 (64 B):  if(!(c030&2)) return; c038&=0x7f; b=bfb8; c2b5=0; c2b6=0; if(b>=100){c2b5=100; return;} FUN_080192e2();
+  This is your minimal fix: while ON, after clearing the marker, clear BOTH countdowns, then schedule exactly one path.
+  Machine code (from the candidate file, capstone; same as arm-none-eabi-objdump of the .elf):
+    080c8d58 10b5     push {r4, lr}
+    080c8d5a 0b4c     ldr  r4, [pc,#0x2c]      ; =0x2001c030 (pool @080c8d88)
+    080c8d5c 2078     ldrb r0, [r4]
+    080c8d5e 8007     lsls r0, r0, #30         ; N = c030 bit1 (ON)
+    080c8d60 11d5     bpl  080c8d86            ; OFF -> done (pure no-op)
+    080c8d62 0a4c     ldr  r4, [pc,#0x28]      ; =0x2001c038 (pool @080c8d8c)
+    080c8d64 2078     ldrb r0, [r4]
+    080c8d66 7f21     movs r1, #0x7f
+    080c8d68 0840     ands r0, r1
+    080c8d6a 2070     strb r0, [r4]            ; c038 &= 0x7f   (marker cleared)
+    080c8d6c 084c     ldr  r4, [pc,#0x20]      ; =0x2001bfb8 (pool @080c8d90)
+    080c8d6e 2068     ldr  r0, [r4]            ; r0 = bfb8 (read BEFORE FUN_080192e2 can change anything)
+    080c8d70 084c     ldr  r4, [pc,#0x20]      ; =0x2001c2b5 (pool @080c8d94)
+    080c8d72 0021     movs r1, #0
+    080c8d74 2170     strb r1, [r4]            ; c2b5 = 0
+    080c8d76 6170     strb r1, [r4,#1]         ; c2b6 = 0   (c2b5/c2b6 are adjacent byte cells; two strb avoid an unaligned strh)
+    080c8d78 6428     cmp  r0, #100
+    080c8d7a 02d2     bcs  080c8d82            ; bfb8 >= 100 -> defer
+    080c8d7c 50f7b1fa bl   080192e2            ; FUN_080192e2  (bl re-encoded + self-checked in the builder; capstone agrees)
+    080c8d80 10bd     pop  {r4, pc}
+    080c8d82 6420     movs r0, #100
+    080c8d84 2070     strb r0, [r4]            ; c2b5 = 100  (stock CEC deferral)
+    080c8d86 10bd     pop  {r4, pc}
+    080c8d88  2001c030 2001c038 2001bfb8 2001c2b5   (literal pool, 4-aligned, 0x080c8d98 onward still 0xFF)
+  Clobbers r0-r3 + r4 (saved) = same contract as the FUN_080192e2 call it replaces.  Stack stays 8-byte aligned (one 2-reg push).
+  Context: both CEC key-action entries are in FUN_0804c39c (called from FUN_0801074c @0x08010790) and FUN_0804bea4 (called from
+  FUN_0804c39c @0x0804c59e); the tick FUN_08011910 is called from FUN_0801074c @0x08010888  => helper and tick are the same (main-loop) thread;
+  the two strb do not race the tick.  Every literal-pool load of c2b5 (22 sites) / c2b6 (16 sites) (fastscan.py 0x2001c2b5 / 0x2001c2b6) is in an
+  application function (0x0801xxxx-0x0806xxxx), none in the TIM ISR region 0x080b9xxx; the c2b6 writers are only FUN_08011910 (decrement), FUN_08019272,
+  FUN_080192e2, FUN_08019378; the other c2b5 writers are FUN_0801074c (bfd8 expiry), FUN_0803497c <- FUN_08034658, FUN_08035ba0 <- FUN_08035968 <- 0x08010196
+  (main loop) and the two replaced FUN_0802d230 blocks.  (A literal scan does not see base+offset accesses such as the helper's own [r4,#1].)
+  Diff vs deliverable: 189 bytes in 17 ranges (r1: 185), all inside the builder's CHANGED_RANGES; vs pristine 1071 bytes in 13 allowed ranges.
+
+EVIDENCE
+  A. test4b.py on r2, python -u test4b.py candidate4b.fw 25 1234 -> TOTAL FAILURES: 0 (7m39s)
+       1  helper unit tests ......................... 72 runs, 0 fail        2  FUN_0802d230 case matrix .............. 288 runs, 0 fail
+       4  cave callback trampoline == helper ....... 0 fail
+       5a helper entered with c2b5/c2b6 pending: c2b5,c2b6 in {0,1,50,100}^2 x bfb8 {0,50,99,100,150,200} x c050 {0,8,0x80,0x88} x zone2 {0,1} = 768 runs, 0 fail
+          asserts: one shutdown entry, not deep, OFF at end, marker clean, first shutdown tick == 0 (forced/immediate: bfb8<100 and (zone2 or c050&0x88)) else 100
+       5b your trace (wake, Standby @50, Standby @110): shutdown entries=1, first_tick=210, bfb8 250 (normal sleep), marker clean -> OK
+       5c 400 random wake + Standby sequences (1-4 Standbys, gaps 0..259 ticks, case 4 / 0x20, random c038 stale marker, random c09c/c050 half the time):
+          400/400 ok (std config 196 with an EXACT timing model: due = last Standby tick seen while ON + 100, a Standby after the shutdown began changes
+          nothing; 243 runs had >=2 Standbys while ON; 316 had the first Standby inside the ~2 s post-wake deferral window)
+       3  differential vs stock references on random RAM ... 1152 runs: 1152 absolute-ok, 864 stock-equal, 288 'forced-early' abs-only, 0 fail
+          reference = the PRISTINE image running the real stock FUN_080192e2 (or stock FUN_0802d230 for Zone 2 on) with the marker pre-cleared by the
+          oracle; deferred class models the stock CEC c2b5=100 with a silent poke.  The helper's own clearing pair ('W b2b5 0','W b2b6 0') is removed
+          from the candidate event list (exactly one adjacent pair required) before the event + RAM equality compare.
+     N=60 / seed 98765 (log test4b_run5_n60.log, 12m39s): TOTAL FAILURES: 0  (5c 480/480; differential 2496 runs: 2496 absolute-ok, 1872 stock-equal, 624 forced-early abs-only, 0 fail)
+  B. NEGATIVE CONTROL (negctl.py, log negctl_final.log; same suite on the r1 60-byte helper): 5a 639/768 FAIL; 5b FAIL (entries=2, first tick 150 = your trace);
+     5c 7/400 FAIL (all 'one_entry', e.g. Standby@0,+65,+41 -> entries at 165 and 206).  5a and 5b are the strong discriminators; 5c is a randomised backstop
+     (the overlap needs a deferral Standby followed by a second one after bfb8 drops below 100 while c2b5 is still pending, rare in random schedules).
+  C. Fresh Ghidra import of the r2 candidate (not the old project), exit 0: helper auto-created FUN_080c8d58 body [080c8d58,080c8d87]; disassembly as above;
+     decompile  if (c030 bit1) { c038 &= 0x7f; u = bfb8; c2b5 = 0; c2b6 = 0; if (u < 100) { FUN_080192e2(); return; } c2b5 = 100; };
+     both FUN_0802d230 blocks = bl helper + NOPs; 3 restored sites = bl 0x08019638; erased 0x080c8a1a..38 and 0x080c8d98..c0 = 0xFF, no code units;
+     references TO the helper: exactly 5 (0802d302, 0802d33c, 0802d39a, 0802d3d4, 080c8a12); FUN_080192e2 11 refs, FUN_08019638 15, FUN_08019272 36.
+  D. Applier dry-run: target sha ok, built sha == 33e62c4a..., 189 changed bytes inside builder ranges, 1071 vs pristine inside 13 allowed ranges,
+     no branch/literal references into the erased 0x080c8a1a..35 trampoline, 3 restored sites + 5 helper callers + helper bytes + erased cave tail verified.
+
+YOUR NON-BLOCKING NOTES - HOW EACH WAS HANDLED
+  1. bfd8 policy inconsistency (deferred route ends bfd8=0, direct route bfd8=3600 => 1-hour sleep->deep on the direct route only).  NOT changed in 4b
+     (it is stock behaviour of the button path too).  Offered to the user as the optional 2-byte patch O1 (below).  Documented as a caveat.
+  2. test4b initialised b2b5/b2b6 to 0 only  -> 5a enumerates {0,1,50,100}^2 and 5c reaches pending countdowns through real wake + Standby sequences.
+  3. 'W c038' events discarded, no final marker assertion -> marker_clean(): no W c038 with bit7 set from the first CEC call on, final c038 bit7 clear;
+     applied in the unit, matrix, differential, 5a/5b/5c checks.  (The stock WAKE path FUN_08019378 itself writes c038=0x80 pass-through before clearing it;
+     events before the first CEC call are deliberately excluded - that is stock wake, not CEC.)
+  4. deferred oracle partly circular -> 5a/5c use an independent timing model (above) in addition to the stock-derived differential.
+
+RESIDUAL RISKS / NOT FIXED (please attack the first one)
+  R1. CEC deferral (c2b5, only within ~2-4 s of wake while bfb8>=100) overlapping a countdown armed by ANOTHER source (c2b6 from button / network / IR).
+      Mitigations found, all verified from the image: the network command pump FUN_08047e4c (@08047e4c) is gated on  c0d8 bit0==0 && c2b6==0 && c2b5==0
+      (literals @08048968=0x2001c0d8, @0804896c=0x2001c2b6, @08048970=0x2001c2b5);  the front-panel key handler FUN_08034658 is gated on c0d8 bit0==0,
+      c2b6==0 (@0803493c), c2b5==0 (@080352e0) and c15c/c29d/c29e==0.  So while either countdown is pending, network and front-panel intake are blocked.
+      NOT excluded: IR / other direct callers of FUN_08019272 (36 callers) / FUN_080192e2 (11).  Same class as stock; needs a CEC deferral AND an IR power key
+      inside the same ~2 s post-wake window.
+  R2. Stock network power-off failed live 3x on the pristine firmware (receiver stayed on 6+ min).  Emulation says the stock path sleeps after 100 ticks; no static
+      cause found (no fade canceller; function-level logic equals the live-proven button path).  The CEC path does not traverse the network request pipeline.
+  R3. Emulator limits (unchanged): no ISRs / real boot / CEC chip / display / hardware timing; unlisted functions stubbed.  Zone-2-ON paths changed only by the
+      bl FUN_080192e2 -> bl helper substitution; Zone-2 behaviour on real hardware unproven.
+  R4. Display: the deferral path shows "Your device is switched off." (c2b5!=0) for ~2 s although the receiver really goes to normal sleep (cosmetic).
+
+OPTIONAL PATCH O1 (not part of 4b; the user decides) - please review too
+  Site 0x08010a56 (FUN_0801074c, the bfd8 slow-tick countdown):  bne 0x08010a80 (13 d1)  ->  b 0x08010a80 (13 e0)    [exactly ONE byte changes: 0x08010a57 d1 -> e0]
+  Effect: the 3600-slow-tick (1 hour) expiry block 0x08010a58..0x08010a7f (c038|=0x80; c03c&=0xfd; c2b5=100 => deep after 1 h asleep) is skipped; the counter
+  still decrements to 0 and stops.  The block is entered only by fall-through from 0x08010a56 (no other direct branch into it; no tbb/tbh in the function).
+  test_o1.py (micro-emulation of 0x08010a36..0x08010a80 on stock-4b vs 4c, bfd8 {0,1,2,3,100,3600}): stock expires only at bfd8==1; O1 never; counter and all
+  other state bit-identical on non-expiry ticks; TOTAL FAILURES 0.   Reason: with the WFI->NOP sleep patch the timers keep running in sleep, so the stock
+  1-hour policy makes the receiver unreachable (deep) after 1 h of direct-route sleep (button, CEC when bfb8<100).  It was a stock energy-saving timer.
+
+LIVE CHECKLIST (the user runs these; I cannot reach the LAN)
+  1. TV standby (steady ON, Zone 2 off): ~2 s "Your device is going to sleep." then reachable "Device sleep" (HA answers, not "switched off", not red-LED-only).
+  2. Power button: normal sleep.   3. CEC standby then power button: no deep shutdown.   4. TV/CEC wake from sleep; HA power-on from sleep.
+  5. YOUR top check: wake the AVR, send Standby ~1 s into the wake, repeat ~1.2 s later: report display/LED and HA reachability at +3 s and +5 s.
+  6. Zone 2 on: directed and broadcast <Standby>.   7. HA power-off retest (stock failed 3x).   8. Long-press power may still do the stock deep off.
+  9. After >1 h in direct-route sleep: reachable (only with O1) / unreachable (without O1).
+
+WHAT I WANT FROM YOU
+  1. VERDICT: CLEAN / FIX FIRST (blockers with evidence).  First confirm the double-entry blocker is closed: re-derive your 150/210 trace on r2 and any other
+     two-countdown interleaving (c2b5/c2b6 pending x Standby at any phase, incl. c2b6<=25 where FUN_08060c64 already ran, Zone 2 on/off).
+  2. Machine-code review of the 64-byte helper above: literal offsets, strb [r4,#1] hitting c2b6, bcs/bpl targets, bl encoding, pool alignment, clobbers.
+  3. Oracle independence (test4b.py 5a/5c/3).  4. Review O1 (one byte) and say whether you would ship it.
+  5. Anything else that can still go deep / stall / lose the request / wedge, and the single live check that would settle it.
+  Report concrete evidence (addresses, bytes, logs), not speculation.

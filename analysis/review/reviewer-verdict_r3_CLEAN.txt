@@ -1,0 +1,25 @@
+r3 RE-REVIEW VERDICT (independent rubber-duck reviewer, turn 4 of 4) -- CLEAN (r3 base image; O1 excluded)
+Candidate sha256 37ba4f65aa35b1a43bc0c8f6b45c5b346d1ed33bd262f543c579c394681f50e6
+
+Blocking issues: none.
+
+1. r2 callback blocker closed. Hook 0x0809b44a restored to pristine f1f7bdfa (bl 0x0808c9c8); cave 0x080c8a0e..35 all 0xFF as pristine.
+   Independent scan: no literal word / direct branch / MOVW+MOVT targets the erased range. Helper has exactly four callers, all in FUN_0802d230:
+   0x0802d302, 0x0802d33c, 0x0802d39a, 0x0802d3d4. Callback-equivalence test 124 runs 0 failures; r2 negative control fails 34/34.
+2. Machine code correct: helper call encodings -> 0x080c8d58; helper calls FUN_080192e2 via 0x080c8d7c; literal pool aligned at 0x080c8d88; both 40-byte blocks keep 18 NOPs
+   and their original branches; r0/r5 redefined at both joins; r4 preserved; stack 8-byte aligned. Restored FUN_08019638 calls 0x08019294/0x0801930e/0x08019348 identical to pristine.
+3. CEC paths: stock case-4/0x20 blocks formerly set c038[7]; r3 replaces them with the helper. Dispatcher tail (0x0802d438..44c: c15e=c0b0, c160=0x708) is not bypassed on helper paths.
+   Helper clears c2b5 AND c2b6 before arming one -> double countdown closed (768 overlap combos pass). Normal IR cannot inject the double-entry trace (FUN_08035ba0 rejects input while bfb8 != 0).
+4. Oracles: section 3 alone not independently sufficient; 3b (tail vs pristine) useful, 2880/2880 at N=60; 4b is a structural/regression oracle (catches r2), not proof the callback is live;
+   6 (APO interplay) meaningful because its sensitivity control shows APO can set the marker; does not model ISR ordering or corrupted config.
+5. Timing: TIM2 60 MHz, PSC 5999 -> 10 kHz; c2b5/c2b6=100 ~ 2 s; slow tick 1 s so bfd8=3600 is 1 hour.
+
+Non-blocking limits:
+ - Callback-only broadcast <Standby> coverage unproven: FUN_0809b3fc is now exactly stock; a TV delivering Standby only via that callback keeps stock (no-sleep) behaviour.
+ - Stock deep policies remain: Auto Power Off, GPIO/long-press forced deep, one-hour bfd8 sleep->deep expiry.
+ - Synthetic invalid config c0b0=1 with APO branch X can race into deep/double entry; menu cycles c0b0 through 0, 0xe10 ... 0x7080, so not a normal setting. Document, do not patch.
+
+O1 (0x08010a57 d1->e0): do NOT ship by default; globally changes power policy; needs a real >1 h soak first. test_o1.py passes.
+
+Most informative live check: Zone 2 off, Auto Power Off disabled: wake via TV/CEC, broadcast <Standby> ~1 s later, repeat ~1.2 s later; report front-panel state and HA reachability at +3 s and +5 s.
+Expected: normal reachable sleep, not red-LED-only deep shutdown.

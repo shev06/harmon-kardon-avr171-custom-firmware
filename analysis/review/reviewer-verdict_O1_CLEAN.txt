@@ -1,0 +1,12 @@
+O1 REVIEW VERDICT (independent rubber-duck reviewer, turn 5) -- CLEAN: ship O1 on top of r3
+r3 37ba4f65aa35b1a43bc0c8f6b45c5b346d1ed33bd262f543c579c394681f50e6 -> r3+O1 85c78bc916a2c6bf3f100a08292972b76bc6e4a5ccf2b7c9826f0139331d0507. Exactly one byte: 0x08010a57 d1 -> e0.
+Trigger: the stock 1-hour sleep->deep timer was observed live after r3 was flashed.
+
+Blocking issues: none.
+- Change correct: 0x08010a56 'bne 0x08010a80' -> 'b 0x08010a80'; target reloads r0, no live register/stack state at the join; no branch/call/raw pointer targets 0x08010a58..0x08010a7f.
+- test_o1.py 0 failures: stock bfd8=1 sets c038|=0x80, c03c&=~2, c2b5=100; O1 decrements to 0 but leaves c038 clear, c03c unchanged, c2b5=0.
+- bfd8 audit: 12 literal-load sites; 4 are the decrement/read in FUN_0801074c (0x08010a36..4e); the rest are writes only (arm 0xe10 at 0x08012efe 0x080192a2 0x0801931c 0x08035704 0x0803679a 0x08049ea0 0x08049f7c; clear at 0x08019398 on wake).
+  Only six 0x2001bfd8 literal words, no MOVW/MOVT construction, no ISR/DMA/indirect reader evidence (a runtime-computed alias cannot be disproved absolutely).
+- No stale state: normal sleep sets c03c bit1 (FUN_08013c0c 0x080147ec..fa); skipped code cleared it only to enter deep; FUN_08019378 handles wake and clears bfd8; O1 never arms c2b5; bfd8 sits at 0 and takes the existing zero branch 0x08010a3e -> 0x08010a80.
+- Other deep routes remain by design: FUN_08012c88 Auto Power Off (only while ON), FUN_0802cd6c hardware-forced, FUN_0803497c/FUN_08035ba0 long-press, FUN_08064ede boot. No other autonomous long-timer-to-marker path found; FUN_08011910 only consumes pending c2b5/c2b6.
+Live soak: Auto Power Off + Zone 2 off, normal CEC Device sleep, poll from HA for 75 min; confirm reachable at 65 and 75 min; then wake via CEC/HA and verify normal operation/audio.

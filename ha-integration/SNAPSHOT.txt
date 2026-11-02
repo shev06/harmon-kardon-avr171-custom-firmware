@@ -1,0 +1,2 @@
+Snapshot (no .git) of ~/harmon-kardon-avr171-hass at commit 5fb94d4 (v1.2.1), taken for archival.
+The canonical repo is the git repo at ~/harmon-kardon-avr171-hass (remote https://github.com/shev06/harmon-kardon-avr171-hass.git). Edit THERE, not here.

@@ -1,0 +1,135 @@
+REVIEW PACK 4 - AVR1710 "Option 4b" r3 (callback-hook blocker fix).   Delta pack: read REVIEW_PACK_4b.txt (root cause + stock semantics) and REVIEW_PACK_4b_r2.txt (helper, r2 evidence).
+==========================================================================================================================================================================================
+
+You returned FIX FIRST on r2 with ONE blocker: the old FUN_0809b3fc callback hook (0x0809b44a: bl 0x080c8a0e -> cave: bl 0x0808c9c8; bl helper; b.w 0x0809b44e) skips the
+dispatcher tail (c15e = c0b0; c160 = 0x708).  With c050 bit2 set (Auto Power Off enabled) and c160 == 1, FUN_08012c88 then sets the marker (c038 |= 0x80) and calls FUN_080192e2
+-> double entry / deep.  Your two fixes: (a) reproduce the tail in the cave, or (b) prove the callback has no consumer and remove the hook.
+This pack is the fix (r3).  Please re-review FROM THE FILES (do not trust this pack).  Modify nothing except scratch files under /tmp/review/.
+
+FILES
+  pristine                  /Users/allisonbulner/AVR1710_USB(V002_23).fw                 sha256 396f14e3...df34b
+  deliverable (UNTOUCHED)   /Users/allisonbulner/AVR1710_USB(V002_23)_patched.fw         sha256 a39f47f2...4898e   (patch #4 + volmute; still the file the user has flashed)
+  candidate 4b (r3)         /tmp/avrwork/candidate4b.fw                                  sha256 37ba4f65aa35b1a43bc0c8f6b45c5b346d1ed33bd262f543c579c394681f50e6
+  candidate 4b (r2, kept)   /tmp/avrwork/candidate4b_r2.fw                               sha256 33e62c4ac32709edc6af869680be19f34ac4c7b55f6b4fd8d75d6317e06c5f99   (used ONLY as the negative control)
+  builder                   /tmp/avrwork/build_candidate_4b.py (r3)   /tmp/avrwork/make_candidate.py (builds candidate4b.fw from the deliverable, never writes the deliverable)
+                            r2 builder kept as /tmp/avrwork/build_candidate_4b.r2.py     helper source /tmp/avrwork/cec_sleep_helper.S (+ .elf/.bin) - UNCHANGED since r2
+  test suite                /tmp/avrwork/test4b.py  (python = /tmp/avrenv/bin/python ; usage: test4b.py <fw> <N> <seed>)   scenario runner run_scen.py, emulator emu.py
+  negative controls         /tmp/avrwork/negctl_cb.py  (runs the NEW sections on the r2 candidate)   log negctl_cb.log
+                            /tmp/avrwork/negctl.py     (r1 60-byte helper, built with the r3 builder; the r2-era sections must still fail)   log negctl_r3.log
+  full-run logs             /tmp/avrwork/test4b_r3_n25.log (seed 1234), /tmp/avrwork/test4b_r3_n60.log (seed 98765)
+  fresh-Ghidra verification /tmp/fresh-candidate4b-v3.log  (FRESH import of the r3 candidate, script .../ghidra-scripts/AVRCecSleep4bVerify.java, exit 0)
+  applier                   /tmp/apply_cec_sleep_fix_4b.py  (dry-run by default; --apply writes with backup + post-verify; DRY RUN PASSES for r3; NOT applied)
+  read-only helpers         /tmp/avrwork/diff_ranges.py <a.fw> <b.fw>   /tmp/avrwork/apo_dis.py <fw>  (FUN_08012c88 with literal-pool annotation)
+  OPTIONAL O1 (separate)    /tmp/avrwork/candidate4c.fw  (= r3 + 1 byte, REBUILT on r3)  sha256 85c78bc916a2c6bf3f100a08292972b76bc6e4a5ccf2b7c9826f0139331d0507   test_o1.py -> TOTAL FAILURES: 0
+
+WHAT CHANGED vs r2  (exactly 14 bytes in 3 ranges: `diff_ranges.py candidate4b_r2.fw candidate4b.fw`)
+  1. 0x0809b44a..0x0809b44c (3 B): the hook  2df0e0fa (bl 0x080c8a0e)  ->  f1f7bdfa  = the STOCK  bl 0x0808c9c8  (identical to pristine)
+  2. 0x080c8a0e..0x080c8a10 (3 B) + 0x080c8a12..0x080c8a19 (8 B): the 12-byte callback trampoline  c3f7dbff 50f766fc d2f71abd  (bl 0x0808c9c8; bl helper; b.w 0x0809b44e)  erased to 0xFF
+     (0x080c8a11 was already 0xFF).  The r2 helper caller at 0x080c8a12 is gone  =>  helper callers 5 -> 4 (0802d302, 0802d33c, 0802d39a, 0802d3d4).
+  EVERYTHING ELSE IS BYTE-IDENTICAL TO r2: the 64-byte helper at 0x080c8d58, the two NOP-sled blocks, the two Zone-2 call-site substitutions, the 3 restored FUN_08019638 sites, the earlier 0x080c8a1a..35 erase.
+  Totals: r3 vs deliverable 199 B in 18 ranges (r2: 189 B / 17 ranges); r3 vs pristine 1057 B in 18 ranges, all inside the 12 allowed ranges of the applier (r2: 1071 B).
+  The region 0x080c8a0e..0x080c8a35 is now 0xFF in the candidate AND in pristine (pristine has non-FF only up to 0x080c89b3).  The Active Source fix cave 0x080c89f8..0x080c8a0d (ends b.w 0x0809b4d8) is untouched.
+
+WHY I CHOSE "RESTORE STOCK" (your option (b), strengthened) INSTEAD OF (a) "reproduce the tail in the cave"
+  * Restoring the hook makes FUN_0809b3fc byte-identical to pristine.  Whatever that function does (live or dead), r3 adds NOTHING to it, so r3 cannot add a new interaction with FUN_08012c88 / the dispatcher tail.
+    Option (a) would have needed more cave code on a path whose liveness is unproven - more surface, not less.
+  * Evidence the additive hook was never the thing that mattered:  the old additive patch (hook + cave, calling FUN_080192e2 after FUN_0808c9c8(1)) was LIVE-TESTED NEGATIVE by the user (symptom unchanged;
+    subsystem-findings.md "LIVE TEST RESULT: negative").  And the user's later symptom text "Your device is switched off." is the c2b5 != 0 string (FUN_0805160c), which only the dispatcher blocks / bfd8 expiry / FUN_0803497c / FUN_08035ba0
+    set; FUN_080192e2 itself arms only c2b6 (DAT_08019c6c = 100) and bfd8 (decompile in /tmp/fresh-candidate4b-v3.log lines 458-485) and never writes c2b5 - so the message most plausibly came from the FUN_0802d230
+    path, not from the callback (supporting evidence, not proof).
+  * Liveness of FUN_0809b3fc (NOT PROVEN dead):  its only caller is FUN_0809b554 (decompile: /tmp/decomp-cecmw.log), whose only reference in the whole image is the literal 0x0809b555 at 0x0808ca64 (re-scanned
+    this session: pointer 0x0809b555 occurs once, 0x0809b3fd never), registered through FUN_0808cbc2 into the table at *(0x2000be2c)+0x1f4/0x1f8.  It handles BROADCAST frames only ((*param_1 & 0xf) == 0xf).
+    FUN_0808c9c8 has exactly 2 callers, both inside FUN_0809b3fc (0x0809b44a, 0x0809b50a) - re-confirmed in the fresh-Ghidra v3 log.  A function that receives its struct pointer through a register is a static-analysis blind spot,
+    which is exactly why I restore stock rather than rely on "dead".
+  * Consequence worth stating: in stock, a broadcast <Standby> seen ONLY by that callback sets the CEC state flag (struct 0x2001a92c + 0xa = 3) and nothing else - no sleep.  That is pristine behaviour and the real
+    <Standby>/Power-Off/Power-toggle path (FUN_0804c39c @0x0804c554, FUN_0804bea4 @0x0804bfb2/@0x0804bfaa -> FUN_0802d230 case 4 / 0x20) is what the helper covers.
+
+EVIDENCE
+  A. test4b.py on r3 (python -u test4b.py candidate4b.fw 25 1234 -> TOTAL FAILURES: 0;  python -u test4b.py candidate4b.fw 60 98765 -> TOTAL FAILURES: 0).  Sections:
+       section                                                            N=25 / seed 1234                         N=60 / seed 98765
+       1  helper unit tests ........................................      72 runs, 0 fail                          72, 0
+       2  FUN_0802d230 case matrix .................................     288 runs, 0 fail                         288, 0
+       3b dispatcher tail oracle (NEW) ............................     1200 runs, 0 fail (1200 equal, tail ran 1200)    2880, 0 (2880 equal)
+       4a image structure (NEW) ...................................     hook == stock bytes f1f7bdfa; cave 0x080c8a0e..35 == FF in cand. and pristine; 3 FUN_08019638 sites stock - all OK  (same)
+       4b callback path == stock (NEW, replaces the old trampoline test)  124 runs, 0 fail                          124, 0
+       5a helper entered with c2b5/c2b6 pending (4x4x6x4x2) ......     768 runs, 0 fail                         768, 0
+       5b your r1 trace (wake, Standby@50, Standby@110) ..........     entries=1 first_tick=210 not deep, OFF, marker clean   (same)
+       5c random wake + Standby sequences ........................     400/400 ok (std 196 w/ exact timing model; >=2 Standbys 243; in deferral window 316)   480/480 (237; 293; 382)
+       6  APO right after a CEC Standby (NEW) ....................     2 sensitivity controls OK + 80 runs, 0 fail    (same)
+       3  differential vs stock references ........................     1152 runs: 1152 abs-ok, 864 stock-equal, 288 forced-early abs-only, 0 fail     2496: 2496 / 1872 / 624, 0 fail
+     What the NEW sections do (so you can judge oracle independence):
+       3b  tail_oracle():  for identical random RAM (random c0b0, c15e, c160, c050, c038, c030 ...), run FUN_0802d230(4) and FUN_0802d230(0x20) on the CANDIDATE and on the PRISTINE image (real stock code, real stock tail) and
+           require c15e / c160 to be EQUAL, with no ticks.  It fails if the tail never ran (all 1200/2880 did: stock value c0b0 / 0x708).  This is the oracle your r2 note said the old differential lacked (it is computed from the pristine image,
+           not from the candidate or from my reading of the tail).
+       4b  hook_equiv():  starts at the hook (path step HOOK -> HOOK+4, i.e. the real bytes at 0x0809b44a with R0=1), then runs FUN_08012c88 and NTICKS ticks, for 120 random inits (incl. APO-on, c15e/c160 in {1,2,..}) + 4 explicit
+           APO-about-to-expire cases; RAM and the full event stream must be bit-identical to pristine.  (Largely implied by 4a - same bytes - but it also proves the harness actually reaches the hook and that APO afterwards is stock.)
+       6   apo():  sensitivity control first (APO alone with an expiring timer MUST set the marker and arm c2b6 = 100, cond 0 and 1 - proves the test can see the failure), then FUN_0802d230 followed by FUN_08012c88
+           (c050 = 0x04, c160 = c15e = 1, c0b0 in {0x3C, 0x258}, FUN_08043504 stub in {0,1}, zone2 in {0,1}, bfb8 in {0,50,99,100,200}): invariants OK (one entry, not deep, marker clean, OFF at end) and the first shutdown tick == 0
+           (bfb8 < 100 and zone 2) else 100.
+  B. NEGATIVE CONTROLS - the new tests detect your blocker:
+       negctl_cb.py on the r2 candidate (negctl_cb.log):  4a structure FAIL x2 (hook != stock, cave not erased);  4b hook_equiv 34/34 FAIL;
+         YOUR reproduction (callback path, then FUN_08012c88 with c050 bit2 set, c160 = 1):  "bfb8 shutdown writes [300, 250], deep=True, marker_clean=False, entries=2" for BOTH conditions (cond 0 and 1).
+       negctl.py (r1 60-byte helper through the r3 builder; negctl_r3.log):  unit=639 trace=1 seq=7 failures (5a 639/768, 5b entries=2 first tick 150, 5c 7/400 'one_entry') - identical to the r2-era control, so the r2-era
+         discriminators still work on the r3 builder.
+  C. FRESH Ghidra import of the r3 candidate (/tmp/fresh-candidate4b-v3.log; not the cached pristine project; exit 0):
+       helper auto-created FUN_080c8d58 body [080c8d58,080c8d87]; disassembly = the 64-byte listing in REVIEW_PACK_4b_r2.txt, literal pool 2001c030 / 2001c038 / 2001bfb8 / 2001c2b5;
+       both FUN_0802d230 blocks = bl 0x080c8d58 + 18 NOPs + the original b (0802d32a -> 0802d356, 0802d3c2 -> 0802d3ee); the two Zone-2 sites 0802d33c / 0802d3d4 = bl 0x080c8d58;
+       3 restored sites 08019294 / 0801930e / 08019348 = bl 0x08019638;
+       HOOK 0x0809b44a = bl 0x0808c9c8 again (stock); the Active Source cave 0x080c89f8..0x080c8a0e intact (beq.w 0809b4c4 ; movw/movt 08099678 ; ldr ; bl 0809b394 ; b.w 0809b4d8);
+       0x080c8a0e..0x080c8a37 = ff x 42, nonFF=0, addrsWithDefinedCodeUnit=0;  0x080c8d98..0x080c8dbf = ff, no code units;
+       references TO 0x080c8a0e: 0;  TO 0x080c8a1a: 0;  TO the helper: exactly 4;  TO FUN_0808c9c8: 2 (both in FUN_0809b3fc, stock);
+       FUN_08019638: 15 refs (= pristine);  FUN_08019272: 36 refs (= pristine);  FUN_080192e2: 11 refs = the 10 stock callers + the helper's own call (pristine: 12 = those 10 + the two Zone-2 sites that now go through the helper; callers.py on pristine confirms 12);
+       decompile of 0x0809b3fc is the stock function (the CEC Active Source length fix at 0x0809b4bc shows as uRam08099678, unchanged from the deliverable).
+  D. Applier dry-run (/tmp/apply_cec_sleep_fix_4b.py): target sha ok; built sha == 37ba4f65...; 199 changed bytes (vs deliverable) inside the builder ranges; 1057 vs pristine inside 12 allowed ranges;
+       NO branch, literal word, or MOVW/MOVT pair references anything in the erased 0x080c8a0e..0x080c8a35 (the MOVW/MOVT scanner has a positive control: it finds the Active Source cave's pair at 080c89fc/080c8a00 building 0x08099678);
+       call-site checks: 3 restored sites, hook == stock (bytes f1f7bdfa and bl target 0x0808c9c8), 4 helper callers, helper bytes, erased cave tail - all OK.
+  E. No image checksum to trip: the update path has only the per-word readback verify and the SP-sanity check of the jump trampoline (subsystem-findings.md lines 72-73, 350); every earlier in-place patched image booted on the user's unit.
+
+APO (FUN_08012c88) - what I re-derived from the disassembly (`apo_dis.py candidate4b.fw`; r3 does not change a byte of it):
+  0x08012c88  r6 = FUN_08043504(); r4 = FUN_08043560(); r5 = byte[c25b]
+  0x08012ca4  if ((r6 & 0xff) == 1):                                    -- branch X
+                0x08012ca8  if (c15e != 0) { c15e--; if (c15e == 0) { if (c050 bit2) c038 |= 0x80;  bl FUN_080192e2 } }
+                0x08012ce8  c160 = 0x708
+              else:                                                     -- branch Y (0x08012cf4)
+                if (((r5 | r4) & 0xff) == 0 && c160 != 0) { c160--; if (c160 == 0) { if (c050 bit2) c038 |= 0x80;  bl FUN_080192e2 }  c15e = low16(word[c0b0]) }   (0x08012d3e)
+                else { c15e = low16(word[c0b0]); c160 = 0x708 }          (0x08012d4c)
+  => stock Auto-Power-Off goes DEEP BY DESIGN when enabled (c050 bit2) - unchanged, not in scope.  Every call refreshes one of the two timers; the dispatcher tail (c15e = c0b0, c160 = 0x708) after a CEC Standby therefore
+     keeps APO from expiring inside the ~2 s fade unless c0b0 is tiny (a stock-class race).  After the shutdown FUN_080192e2 is a no-op (acts only while ON).
+
+HOW EACH OF YOUR r2 POINTS WAS HANDLED
+  1. BLOCKER (callback skips the dispatcher tail):  closed by removal - hook restored to stock bytes, trampoline erased, nothing in the image references the erased range (applier scan + fresh Ghidra: 0 refs).
+     Tested three ways: 4a (bytes), 4b (bit-identical callback path then APO), negative control on r2 reproducing your [300, 250] trace.
+  2. "differential section 3 is not an independent oracle for this case":  added 3b (pristine-derived tail oracle) and 6 (APO interplay with sensitivity controls).  Section 3 itself unchanged.
+  3. "I would not ship O1 by default":  agreed and unchanged - O1 is NOT in r3.  It was rebuilt on r3 only so it is available if the user explicitly wants indefinite reachability (see below).
+
+RESIDUAL RISKS / NOT FIXED  (please attack R1 and R4)
+  R1. CEC deferral (c2b5, only inside ~2-4 s after wake while bfb8 >= 100) overlapping a c2b6 countdown armed by ANOTHER source (button / network / IR).  Same class as stock.  Network pump FUN_08047e4c is gated on
+      c0d8 bit0 == 0 && c2b6 == 0 && c2b5 == 0 and the front-panel handler FUN_08034658 on c0d8 bit0 == 0, c2b6 == 0, c2b5 == 0; IR / the other direct callers of FUN_08019272 (36) and FUN_080192e2 (11) are NOT excluded.
+  R2. bfd8 policy (1-hour sleep -> deep).  Direct route (button, CEC when bfb8 < 100) leaves bfd8 = 3600; at expiry FUN_0801074c @0x08010a58 does c038 |= 0x80; c03c &= 0xfd; c2b5 = 100 -> deep.  With WFI->NOP the timers run in sleep,
+      so after ~1 h of direct-route sleep the unit is unreachable (stock energy-saving timer).  The deferred route ends with bfd8 = 0.  O1 removes it (below).
+  R3. Stock network power-off failed live 3x on the PRISTINE firmware (stayed on 6+ min).  Emulation says it sleeps after 100 ticks; no static cause found.  The CEC path does not traverse the network request pipeline.
+  R4. FUN_0809b3fc liveness unproven (restored to stock either way - see above).
+  R5. Emulator limits: no ISRs / real boot / CEC chip / display / real timing; unlisted functions are stubbed (FUN_08043504 return value is an explicit parameter).  Zone-2-ON behaviour on hardware is unproven.
+  R6. Cosmetic: the deferral path shows "Your device is switched off." (c2b5 != 0) for ~2 s although the unit really goes to normal sleep.
+  R7. Stock APO (when enabled) still goes deep by design; long-press power still does the stock deep off (FUN_0803497c / FUN_08035ba0); FUN_0802cd6c hardware-input forced deep, FUN_08064ede boot: all untouched.
+
+OPTIONAL O1 (not part of r3; the user decides) - unchanged from the r2 pack, rebuilt on r3
+  Site 0x08010a56 (FUN_0801074c): bne 0x08010a80 (13 d1) -> b 0x08010a80 (13 e0): ONE byte (0x08010a57 d1 -> e0).  Skips the 3600-slow-tick expiry block 0x08010a58..0x08010a7f.  test_o1.py (micro-emulation of
+  0x08010a36..0x08010a80, bfd8 in {0,1,2,3,100,3600}) on candidate4b.fw vs candidate4c.fw: stock expires only at bfd8 == 1, O1 never, counter and all other state identical -> TOTAL FAILURES: 0.
+
+LIVE CHECKLIST (the user runs these; I cannot reach the LAN)
+  1. TV standby (steady ON, Zone 2 off): ~2 s "Your device is going to sleep." then reachable "Device sleep" (HA answers; not "switched off"; not red-LED-only).
+  2. Power button: normal sleep.   3. CEC standby then power button: no deep shutdown.   4. TV/CEC wake from sleep; HA power-on from sleep.
+  5. YOUR top check: wake the AVR, send Standby ~1 s in, repeat ~1.2 s later; report display/LED and HA reachability at +3 s and +5 s.
+  6. Zone 2 on: directed and broadcast <Standby>.   7. HA power-off retest (stock failed 3x).   8. Long-press power may still do the stock deep off.
+  9. If Auto Power Off is enabled: arrange its expiry right after a Standby; check the front panel and HA at +5 s.
+ 10. After >1 h in direct-route sleep: reachable only with O1.
+
+WHAT I WANT FROM YOU
+  1. VERDICT: CLEAN / FIX FIRST (blockers with evidence).  First confirm the r2 blocker is closed on r3: re-derive your trace (callback path -> FUN_08012c88 with c050 bit2 set and c160 == 1) from the BYTES of candidate4b.fw
+     (hook 0x0809b44a, cave 0x080c8a0e..35) and any remaining route by which FUN_080192e2 / the marker can be reached without the dispatcher tail running.
+  2. Is "restore stock + erase" complete?  Look for anything else that referenced the erased trampoline or depended on the additive hook (literal pools, jump tables, tbb/tbh, MOVW/MOVT, data words in the 0x080c8xxx cave region).
+  3. Oracle independence of 3b / 4b / 6 (and anything the differential in section 3 still cannot see).
+  4. Anything else that can still go deep / stall / lose the request / wedge on the dispatcher + helper path, and the SINGLE live check that would settle it.
+  5. Your stance on O1 (unchanged unless you found a reason).
+  Report concrete evidence (addresses, bytes, logs), not speculation.

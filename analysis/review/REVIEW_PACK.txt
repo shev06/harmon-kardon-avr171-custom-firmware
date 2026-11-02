@@ -1,0 +1,88 @@
+REVIEW PACK - AVR1710 firmware patch "Option 4" (CEC standby -> normal reachable sleep)
+===========================================================================================
+
+TARGET: Harman Kardon AVR1710, STM32F4 Cortex-M4 (Thumb-2), image base 0x08000000, 6,291,456 bytes.
+Static analysis with Ghidra (decompile logs in /tmp/decomp-*.log), Unicorn emulation in /tmp/avrwork.
+No LAN/hardware access from this environment; the user flashes & tests live.
+
+FILES
+  pristine firmware : /Users/allisonbulner/AVR1710_USB(V002_23).fw
+  current deliverable (patch #4 + other fixes, NOT yet modified): /Users/allisonbulner/AVR1710_USB(V002_23)_patched.fw
+  candidate (deliverable + Option 4): /tmp/avrwork/candidate.fw      (built by /tmp/avrwork/build_candidate.py)
+  python (capstone+unicorn): /tmp/avrenv/bin/python ; helper /tmp/avrwork/avrlib.py (fw, u32(addr), dis(addr,n,data=), show)
+  function ranges: /tmp/avrwork/funcranges.txt ; call scanner /tmp/avrwork/blscan.py ; RAM-bit scanner /tmp/avrwork/fastscan.py
+  emulator: /tmp/avrwork/emu.py, run_scen.py, compare.py, fuzz.py
+  decompiles: /tmp/decomp-core.log (FUN_080192e2, FUN_08019272, FUN_0802d230 ...), /tmp/decomp-12f6c.log (FUN_08019638, FUN_08019378, FUN_0802dd94/dcb4, FUN_080192ce, FUN_08012f6c), /tmp/decomp-mk.log (FUN_08034658/0803497c/08035968/08035ba0), /tmp/decomp-seq.txt (FUN_08013c0c sequencer), /tmp/decomp-mainloop.log
+
+USER GOAL
+  When the TV sends CEC <Standby> (or CEC User-Control Power Off / Power toggle) the receiver must enter the SAME
+  reachable "Device sleep" state the front-panel power button produces (network alive, controllable by Home Assistant),
+  NOT the stock "deep power-down" (red LED only, network dead).
+  Earlier patch #4 (current deliverable) made the CEC flow stall: "Your device is switched off" message but receiver stays ON;
+  a later power-button press then hard-shuts-down instead of sleeping.  Button alone sleeps normally.
+
+ROOT-CAUSE MODEL (claims to be challenged)
+  * RAM byte 0x2001c038 bit 7 = "go DEEP power-down" marker.
+  * FUN_08019638 (shutdown entry, clears c030 bit1 = ON) sets 0x2001bfb8 = 300 if marker set else 250.
+  * FUN_08013c0c (power-down sequencer, called each tick from FUN_08011910) counts bfb8 down; at step 0xaf:
+      marker set  -> DEEP variant   (c09c |= 0x40, marker cleared, ~76 GPIO writes all low, c2ab=7, FUN_08011618(1))
+      marker clear-> NORMAL variant (c03c |= 3, c27f = 0, 53 GPIO writes)  == "Device sleep" (network alive because WFI was NOP'd by an earlier patch)
+  * FUN_0802d230 = CEC key-action dispatcher.  Case 4 = power off (CEC <Standby> from FUN_0804c39c @0x0804c554, User-Control PowerOff
+    from FUN_0804bea4 @0x0804bfb2), case 0x20 = power toggle (FUN_0804bea4 @0x0804bfaa).  Only CEC code calls it with 4 or 0x20
+    (other callers pass 1,2,3,5,6,7,0x21 etc).
+  * Case 4 / 0x20 when ON:
+      gate B = (0x2001c09c bit0 = "Zone 2 ON") TRUE  -> c050 &= ~4; bl FUN_080192e2; PB9 low; PE1 low        (normal)
+      gate B FALSE (0x0802d302.. / 0x0802d39a..)     -> c038 |= 0x80 (marker); c03c &= 0xfd; 0x2001c2b5 = 100  (stock deep trigger)
+  * FUN_080192e2 (power-off; only acts if c030 bit1 ON): if bfb8<100: (gate B clear && (c050&0x88)==0) -> arm 2b6=100, bfd8=0xe10 and return
+    ("going to sleep" countdown consumed by FUN_08011910: at 25 FUN_08060c64, at 0 FUN_08019638); else FUN_08019638 immediately.
+    if bfb8>=100: c050 bit3 -> FUN_08019638 else c038 &= 0x7f.   FUN_08019272 = button/toggle equivalent.
+    Network "power-off" (FUN_08049d90) calls FUN_080192e2() -> that is the known-good path (no marker).
+  * FUN_08019378 (power-on) clears marker, 2b6, bfd8, re-inits idle timer.
+  * ALL sites that set marker (c038 |= 0x80): FUN_0801074c@0x08010a58 (bfd8 countdown), FUN_08012c88 x2 (auto power-off, user has it disabled),
+    FUN_0802cd6c (zone2 combo: sets, calls FUN_080192e2, clears), FUN_0802d230 x2 (the two being patched), FUN_0803497c x4 + FUN_08035ba0 x4
+    (front-panel/IR key dispatchers: key codes 0x30f/0x311 = 'long-press power' style deep path when Zone2 off), FUN_08064ede x2 (boot).
+    Only the two FUN_0802d230 sites are reachable from the CEC handlers (BFS over direct bl calls from FUN_0804c39c/FUN_0804bea4).
+
+THE PATCH ("Option 4") applied on top of the deliverable (see /tmp/avrwork/build_candidate.py)
+  1. Restore 3 call sites to STOCK bytes (patch #4 had redirected them to a no-op trampoline @0x080c8a1a):
+       0x08019294: aff0c1fb -> 00f0d0f9 (bl FUN_08019638)
+       0x0801930e: aff084fb -> 00f093f9
+       0x08019348: aff067fb -> 00f076f9
+  2. 0x0802d302..0x0802d329 (40 bytes) := bl 0x080192e2 (ebf7eeff) + 18 x nop (00bf);  the original 'b 0x0802d356' @0x0802d32a is kept.
+     0x0802d39a..0x0802d3c1 (40 bytes) := bl 0x080192e2 (ebf7a2ff) + 18 x nop;           the original 'b 0x0802d3ee' @0x0802d3c2 is kept.
+  3. The now-unreferenced no-op trampoline bytes @0x080c8a1a (28 bytes: 7047 + 13*00bf) reset to 0xFF (pristine value).
+  Gate-B-true paths untouched.
+
+  disassembly (case 4) pristine vs candidate is dumped by:  cd /tmp/avrwork && /tmp/avrenv/bin/python (see avrlib.show)
+
+EMULATION EVIDENCE (Unicorn; real code for FUN_08011910, 08013c0c, 080192e2, 08019272, 08019378, 08019638, 0802d230, 0804b208/0c, 08060c64;
+  every other Ghidra function stubbed 'movs r0,#N; bx lr'; RAM zero-init + c030 bit1 = ON; GPIO BSRR writes and watched RAM bytes logged)
+  S1 stock CEC (4 and 0x20, gate B clear): marker, 2b5=100 ... tick 225 DEEP variant (c2ab=7, 76 GPIO writes)   == user's "red light only"
+  S2 stock BUTTON, S5 stock NETWORK: 2b6=100, bfd8=3600, tick 25 FUN_08060c64, tick 100 FUN_08019638 -> bfb8=250 -> NORMAL variant (53 GPIO writes)
+  S4 deliverable (patch #4) CEC: c030 stays ON, c038 stays 0x80 (stuck marker), 0 GPIO writes  == user's "switched off message but doesn't turn off";
+     then BUTTON press -> 2b6 countdown -> FUN_08019638 -> bfb8=300 -> DEEP   == user's "then power button fully shuts down"
+  S3 candidate CEC case 4 and 0x20: RAM+events identical to S5 NETWORK (except dispatcher idle-timer bytes 0x2001c15e..61), NORMAL variant, no deep.
+     candidate BUTTON == stock BUTTON, candidate NETWORK == stock NETWORK  (restored call sites are complete).
+  Randomized differential fuzz (random RAM in [0x2001bf00,0x2001c500), marker clear/stale, gate B 0/1, 60 runs each, seed 1234):
+     gate B=0: candidate CEC4 == stock NETWORK 60/60 (both markers); candidate CEC0x20 == stock NETWORK 60/60; deep-after-candidate-CEC = 0 (marker clear)
+     gate B=1: candidate CEC == stock CEC 60/60 (untouched path).  0 skips/timeouts, 0 FAILS.
+
+KNOWN LIMITS / UNKNOWNS (please attack these)
+  * Emulator does NOT model: the real boot/scatter-load, interrupts/ISRs, main loop FUN_0801074c, the CEC bus/chip, display, other tasks, real timing.
+  * Early PB9/PE1 low writes + (c050 &= ~4) that the gate-B-true block does after FUN_080192e2 are NOT performed in the new gate-B-false path
+    (network path does not do them either; the sequencer writes B9/E1 low itself).
+  * The 2b5 "Your device is switched off" countdown is no longer used on this path.
+  * bfd8 (=3600 main-loop countdown, armed by FUN_080192e2/FUN_08019272) expires some time after sleep and (stock) sets marker+c03c&=0xfd+2b5=100;
+    while asleep FUN_080192e2 is a no-op (acts only if c030 bit1 ON).  Same as the validated button path.
+  * Whether CEC power-ON wake from the new sleep works is untested (same state as after button sleep).
+
+WHAT I WANT FROM THE REVIEWER
+  1. Independently re-derive (from the disassembly / decompile logs / emulator) whether the root-cause model is right, esp. the claim that
+     the deep path is chosen ONLY by marker c038 bit7 at sequencer step 0xaf and that case 4/0x20 gate-B-false is the only CEC-reachable marker setter.
+  2. Look for ANY way the patched CEC path can still produce a deep power-down or a stall (stale marker, c050 bits 3/7, bfb8>=100, 2b6 already running,
+     re-entrancy: second <Standby> arriving during the countdown, <Standby> arriving while already asleep, Zone2 toggling mid-flow, HDMI hot-plug sequences).
+  3. Check the machine-code edits for encoding/flow errors (bl encodings, NOP sleds, branch targets, registers live across the removed block at the join
+     0x0802d356 / 0x0802d3ee, stack usage), and that nothing else references the cleared 0x080c8a1a trampoline.
+  4. Check that the restored 3 call sites are bit-identical to pristine and that the final diff vs pristine contains only intended changes.
+  5. Say plainly what ELSE could make this fail on real hardware and what single check would settle it.
+  Report concrete evidence (addresses, bytes, logs), not speculation. Do NOT modify any file other than scratch files under /tmp/review/.

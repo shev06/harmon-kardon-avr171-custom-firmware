@@ -1,0 +1,12 @@
+# Firmware images are Harman Kardon's copyrighted code (and patched derivatives): never publish them.
+firmware/
+build/
+.venv/
+ghidra/project/
+analysis/logs/
+history/
+__pycache__/
+*.pyc
+.DS_Store
+# Raw scan dumps containing disassembly of the stock firmware
+harness/*.out

@@ -1,0 +1,101 @@
+
+Merging object attributes
+
+
+Discarded input sections
+
+ .comment       0x00000000       0x13 startup.o
+ .ARM.attributes
+                0x00000000       0x2e startup.o
+ .comment       0x00000000       0x13 main.o
+ .ARM.attributes
+                0x00000000       0x2e main.o
+
+Memory Configuration
+
+Name             Origin             Length             Attributes
+BOOTLOADER       0x08000000         0x00010000         xr
+APPFLASH         0x08010000         0x000f0000         xr
+RAM              0x20000000         0x00020000         xrw
+*default*        0x00000000         0xffffffff
+
+Linker script and memory map
+
+LOAD startup.o
+LOAD main.o
+
+.isr_vector     0x08010000       0x10
+                0x08010000                        . = ALIGN (0x4)
+ *(.isr_vector)
+ .isr_vector    0x08010000       0x10 startup.o
+                0x08010000                vector_table
+                0x08010010                        . = ALIGN (0x4)
+
+.text           0x08010010       0x78
+                0x08010010                        . = ALIGN (0x4)
+ *(.text*)
+ .text          0x08010010       0x64 startup.o
+                0x08010010                Reset_Handler
+                0x0801006c                HardFault_Handler
+                0x0801006c                NMI_Handler
+                0x0801006c                Default_Handler
+ .text          0x08010074       0x14 main.o
+                0x08010074                main
+ *(.rodata*)
+                0x08010088                        . = ALIGN (0x4)
+                0x08010088                        _sidata = LOADADDR (.data)
+
+.glue_7         0x08010088        0x0
+ .glue_7        0x08010088        0x0 linker stubs
+
+.glue_7t        0x08010088        0x0
+ .glue_7t       0x08010088        0x0 linker stubs
+
+.vfp11_veneer   0x08010088        0x0
+ .vfp11_veneer  0x08010088        0x0 linker stubs
+
+.v4_bx          0x08010088        0x0
+ .v4_bx         0x08010088        0x0 linker stubs
+
+.iplt           0x08010088        0x0
+ .iplt          0x08010088        0x0 startup.o
+
+.rel.dyn        0x08010088        0x0
+ .rel.iplt      0x08010088        0x0 startup.o
+
+.data           0x20000000        0x0 load address 0x08010088
+                0x20000000                        . = ALIGN (0x4)
+                0x20000000                        _sdata = .
+ *(.data*)
+ .data          0x20000000        0x0 startup.o
+ .data          0x20000000        0x0 main.o
+                0x20000000                        . = ALIGN (0x4)
+                0x20000000                        _edata = .
+
+.igot.plt       0x20000000        0x0 load address 0x08010088
+ .igot.plt      0x20000000        0x0 startup.o
+
+.bss            0x20000000        0x4 load address 0x08010088
+                0x20000000                        . = ALIGN (0x4)
+                0x20000000                        _sbss = .
+ *(.bss*)
+ .bss           0x20000000        0x4 startup.o
+                0x20000000                loop_counter
+ .bss           0x20000004        0x0 main.o
+ *(COMMON)
+                0x20000004                        . = ALIGN (0x4)
+                0x20000004                        _ebss = .
+
+._user_heap_stack
+                0x20000004     0x1004 load address 0x08010088
+                0x20000008                        . = ALIGN (0x8)
+ *fill*         0x20000004        0x4 
+                0x20001008                        . = (. + 0x1000)
+ *fill*         0x20000008     0x1000 
+                0x20001008                        . = ALIGN (0x8)
+
+/DISCARD/
+ *(.comment)
+ *(.ARM.attributes)
+OUTPUT(test.elf elf32-littlearm)
+LOAD linker stubs

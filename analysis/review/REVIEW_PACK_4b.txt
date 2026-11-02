@@ -1,0 +1,107 @@
+REVIEW PACK 2 - AVR1710 "Option 4b" (CEC standby -> normal reachable sleep).  Supersedes REVIEW_PACK.txt (Option 4).
+=====================================================================================================================
+
+You previously returned FIX FIRST on Option 4 with two blockers.  Option 4b is the redesign.  Please re-review it from scratch
+(do not trust this pack; re-derive from the files).  Do NOT modify anything except scratch files under /tmp/review/.
+
+FILES
+  pristine firmware          /Users/allisonbulner/AVR1710_USB(V002_23).fw                 sha256 396f14e3...df34b
+  current deliverable        /Users/allisonbulner/AVR1710_USB(V002_23)_patched.fw         sha256 a39f47f2...4898e  (patch #4 + volmute; NOT modified)
+  candidate 4b               /tmp/avrwork/candidate4b.fw                                  sha256 421fbbb2...3b093
+  builder (edit list)        /tmp/avrwork/build_candidate_4b.py      helper source /tmp/avrwork/cec_sleep_helper.S (+ .bin/.elf)
+  validation suite           /tmp/avrwork/test4b.py   (python = /tmp/avrenv/bin/python ; usage: test4b.py <fw> <N> <seed>)
+  fresh-Ghidra verification  /tmp/fresh-candidate4b.log (fresh import of candidate4b.fw, script AVRCecSleep4bVerify.java)
+  libs                       /tmp/avrwork/avrlib.py (fw=PRISTINE, u32, show, dis), annot.py (disasm with literal-pool values), fastscan.py <ram> [bit]
+  earlier evidence           /tmp/decomp-*.log, /tmp/pristine-refs*.log, /tmp/xref-cd6c.log, /tmp/decomp-cd6c.log, /tmp/decomp-10184.log
+  (the previous pack /tmp/avrwork/REVIEW_PACK.txt still describes the root-cause model and the stock function semantics)
+
+GOAL (unchanged)
+  TV sends CEC <Standby> (or CEC User-Control Power-Off / Power toggle) -> receiver must enter the SAME reachable "Device sleep"
+  the front-panel button produces (network alive, Home Assistant keeps control), NOT the stock deep power-down (red LED only).
+
+ROOT CAUSE (unchanged; emulation-confirmed on pristine)
+  c038 bit7 = "go DEEP" marker.  FUN_08019638 (shutdown entry) -> bfb8 = 300 if marker else 250.  Sequencer FUN_08013c0c step 0xaf:
+  marker -> DEEP (c09c|=0x40, c2ab=7, 76 GPIO low); no marker -> NORMAL "Device sleep" (c03c|=3, c27f=0, 53 GPIO writes).
+  Stock CEC dispatcher FUN_0802d230 case 4 (power-off) / 0x20 (toggle), Zone-2-OFF branch: c038|=0x80; c03c&=0xfd; c2b5=100  => deep.
+  Patch #4 (deliverable) turned FUN_08019638's 3 call sites into a no-op, which stalls the machine (marker stuck) => user's symptoms.
+
+YOUR TWO BLOCKERS ON OPTION 4 AND HOW 4b ANSWERS THEM
+  Blocker 1  stale marker while ON (a marker left in c038 by an earlier interrupted shutdown would still make the next sleep deep) and
+             a CEC <Standby> arriving while the receiver is already OFF/asleep/shutting down must not convert that shutdown to deep.
+     4b: helper does   if (c030 bit1 == 0) return;  c038 &= 0x7f;   i.e. OFF => pure no-op (no marker touch), ON => marker dropped first.
+  Blocker 2  FUN_080192e2 with bfb8>=100 (power-on sequence still running) silently DROPS the request (c038&=0x7f only).
+     4b: helper reads bfb8 BEFORE calling FUN_080192e2; if bfb8>=100 it defers with  c2b5 = 100  (stock CEC's own mechanism, 100 ticks of
+         FUN_08011910 = ~2.0 s, minus the marker and minus the c03c clear).  At expiry the tick does  c050|=8; (ON ? FUN_080192e2() : FUN_08019638());
+         c050&=0xf7  => FUN_080192e2 goes immediate (bfb8>=100 && c050 bit3 => FUN_08019638) with the marker already clear => NORMAL sleep.
+
+THE PATCH (diff vs deliverable = 185 bytes, 17 ranges; vs pristine only the earlier patches + these)
+  1. Restore 3 call sites to STOCK bytes:  0x08019294 00f0d0f9, 0x0801930e 00f093f9, 0x08019348 00f076f9  (bl FUN_08019638)
+  2. 0x0802d302..0x0802d329 := bl helper + 18 NOP ;  0x0802d39a..0x0802d3c1 := bl helper + 18 NOP  (original 'b' at 0x0802d32a / 0x0802d3c2 kept)
+  3. `bl FUN_080192e2` -> `bl helper` at 0x0802d33c, 0x0802d3d4 (Zone-2-ON power-off branches) and 0x080c8a12 (cave callback trampoline
+     0x080c8a0e: bl 0x0808c9c8; bl helper; b.w 0x0809b44e  - the old FUN_0809b3fc path, very likely dead but NOT proven dead)
+  4. 28-byte dead patch-#4 trampoline 0x080c8a1a..0x080c8a35 erased to 0xFF.
+  5. New 60-byte helper at 0x080c8d58..0x080c8d93 (cave was 0xFF; 0x080c8d94..0x080c8dc0 still 0xFF):
+       10b50a4c207880070ed5094c20787f2108402070074c2068642802d250f7b5fa10bd054c6420207010bd00bf30c0012038c00120b8bf0120b5c20120
+     logic:  push{r4,lr}; if(!(c030&2)) goto done; c038&=0x7f; if(bfb8>=100){c2b5=100;goto done} FUN_080192e2(); done: pop{r4,pc}
+     literal pool: 2001c030, 2001c038, 2001bfb8, 2001c2b5.   Source: cec_sleep_helper.S (assembled with arm-none-eabi-as, verified by objdump).
+
+EVIDENCE
+  A. test4b.py (Unicorn; real code for FUN_08011910/08013c0c/080192e2/08019272/08019378/08019638/0802d230/helper, other functions stubbed):
+     python test4b.py /tmp/avrwork/candidate4b.fw 25 1234  -> TOTAL FAILURES: 0   (log /tmp/avrwork/test4b_run2.log)
+       Sec1 helper unit tests (72 runs: ON/OFF x marker x bfb8 {0,99,100,299,300,...} x c050 bits) .......... 0 failures
+       Sec2 dispatcher matrix (key 4 and 0x20 x Zone2 on/off x ON/OFF x marker x bfb8 classes) 288 runs ..... 0 failures
+       Sec3 differential vs stock-derived reference, random RAM (1152 runs): 1152 abs_ok, 864 diff_equal, 288 abs_only_force_early, 0 fails
+       Sec4 cave callback trampoline == helper alone ......................................................... 0 failures
+     Two oracle artefacts were found and fixed IN THE ORACLE (not in the patch), please check you agree:
+       (i) 'W c038' events differ (helper clears the marker itself; stock path writes it differently) -> excluded from the compare, the final c038 is asserted.
+       (ii) the deferred class (bfb8>=100, c050 bit3 clear) differs from the reference by exactly one extra ('W','b2b5',100) event = the helper's own
+            strb that implements the deferral; the oracle now asserts exactly one such event and removes it, then requires identical RAM+events.
+     'abs_only_force_early' class = bfb8>=100 AND c050 bit3 already set when the dispatcher runs.  fastscan: c050 bit3 is set only at 0x080119ae and
+     cleared at 0x080119d4, both inside FUN_08011910's c2b5-expiry call, i.e. transient inside the tick => unreachable from the dispatcher.
+     (An N=60 / seed 98765 rerun is in /tmp/avrwork/test4b_run3.log when it finishes.)
+  B. Fresh Ghidra import of candidate4b.fw (not the old project): helper decodes exactly as designed, auto-created as FUN_080c8d58 (body ..0d81);
+     both FUN_0802d230 blocks = `bl 0x080c8d58` + 18 NOP + original `b`; 3 restored sites = `bl 0x08019638`; erased regions 0xFF with no code units;
+     references TO the helper: exactly 5 (0x0802d302, 0x0802d33c, 0x0802d39a, 0x0802d3d4, 0x080c8a12);
+     xref counts vs pristine: FUN_08019638 15 callers in both (identical sets); FUN_08019272 36 in both; FUN_080192e2 12 -> 11
+     (loses 0x0802d33c/0x0802d3d4, gains the helper's own call at 0x080c8d74).  FUN_0802d230 decompile: cases 4/0x20 only reach FUN_080c8d58().
+  C. Caller audit: all 43 call sites of FUN_0802d230 pass constant keys; only three pass 4 or 0x20: 0x0804c554 (key 4, <Standby> in FUN_0804c39c),
+     0x0804bfb2 (4) and 0x0804bfaa (0x20) in FUN_0804bea4.  => no IR/dynamic path reaches the helper.
+  D. FUN_0802cd6c (sets marker; called once from main loop FUN_08010184 @0x080101ee when c044 bit5 is set; that bit is set only at 0x080b9baa
+     in the TIM2 CC2 (1 ms) ISR: debounce of GPIOE pin4 (0x40021000, mask 0x10) with high/low counters bfc0/bfc4 reaching 0x50 (80 ms), and
+     (c030 bit1 ON or c09c bit0 Zone2) and c2ad==0): does c050|=0x80; c038|=0x80; FUN_080192e2(); c050&=0x7f
+     = hardware-input (protection-style) forced deep shutdown, not CEC => intentionally left alone.
+  E. Stock-function facts established while closing Blocker 2 (all from decompiles / emulation):
+       FUN_08019272 (button) with bfb8>=100 and ON: c038&=0x7f and the press is DROPPED (stock button also ignores early presses).
+       FUN_08011910 display strings (FUN_0805160c): c2b6!=0 => "Your device is going to sleep."; c2b5!=0 => "Your device is switched off."
+       => the deferral path may show "switched off." for ~2 s while the receiver really goes to normal sleep (cosmetic).
+  F. TIMING (newly resolved this session, please sanity-check):
+       SystemInit/SetSysClock @0x0808bb98: HSE 25 MHz, PLLM=25 N=240 P=2 => SYSCLK 120 MHz, APB1 /4 = 30 MHz => TIM2 clock 60 MHz.
+       TIM2 init @0x08065d3e: PSC=0x176f (5999) => 10 kHz; CC1 inc=1 (100 us), CC2 inc=10 (1 ms), CC3 inc=100 (10 ms)  [init values obtained by
+       emulating the IAR data-init routine 0x080befdc from the pristine image: /tmp/avrwork/dinit.py].
+       TIM2 CC2 ISR increments c272 every 1 ms; FUN_0801074c: when c272>=10 (10 ms) it runs FUN_08011700, toggles bff4 bit0 and calls FUN_08011910
+       only when bit0 became set => FUN_08011910 runs every ~20 ms => c2b5/c2b6 = 100 means ~2.0 s.
+       TIM2 CC3 ISR: counters c278..c27e count 10 ms events; c278 reaching 100 resets it and sets c030 bit0 => 1 s "slow tick" (only setter: 0x080b9cf0;
+       only consumer: FUN_0801074c@0x08010a1a/0x08010a26, fastscan-verified).  The bfd8 countdown (armed to 0xe10 = 3600 by the fade path, button AND
+       CEC alike) therefore lasts 3600 s = 1 HOUR; at 0 FUN_0801074c does c038|=0x80; c03c&=0xfd; c2b5=100 => stock "sleep -> deep after 1 h".
+       This is the same for the button path and is NOT changed by 4b.  With the earlier WFI->NOP patch (0x08064e0e) the timers keep running in sleep.
+
+KNOWN LIMITS (attack these)
+  * Emulator does not model ISRs, the real boot, the CEC chip/bus, display, real timing; everything outside the real-code list above is stubbed.
+  * Zone-2-ON paths: only the `bl FUN_080192e2` -> `bl helper` substitution (marker clear + deferral); previously stock.  Zone-2 behaviour on real HW unproven.
+  * The early PB9/PE1 low writes and c050&=~4 of the stock Zone-2-ON block are untouched.
+  * Marker setters intentionally left alone: FUN_0801074c@0x08010a58 (bfd8 expiry), FUN_08012c88 x2 (auto power-off, user has it disabled),
+    FUN_0802cd6c (HW-event), FUN_0803497c x4 / FUN_08035ba0 x4 (IR / front-panel long-press power = stock full-off), FUN_08064ede x2 (boot).
+  * Long-press power and the 1-hour bfd8 expiry still go deep by design (stock).
+
+WHAT I WANT FROM YOU
+  1. VERDICT: CLEAN / FIX FIRST (list each blocker with evidence).  Re-check both previous blockers are truly closed by 4b, plus:
+  2. Any way a CEC <Standby>/<User Control Power Off>/toggle can still yield deep, a stall, a lost request, or a wedge:
+     - Standby while: ON+fresh wake (bfb8 in [100,300)), ON+fade already running (c2b6!=0), ON+c2b5 already running (e.g. from bfd8), OFF+sequencer running,
+       OFF+asleep, Zone 2 on/off/toggling, a second <Standby> during the 2 s fade, broadcast vs directed.
+     - Interaction of the deferral (c2b5=100) with the display countdown, with bfd8, with FUN_08011910's `c050|=8` force flag and with FUN_08019272's early-press drop.
+  3. Machine-code review of the 185-byte diff: bl encodings/ranges, the NOP sleds, branch targets and registers live across the replaced blocks at the joins
+     0x0802d32a->0x0802d356 and 0x0802d3c2->0x0802d3ee, stack alignment/regs clobbered by the helper (r4 saved, r0-r3 scratch like the callee it replaces),
+     literal-pool alignment, nothing else referencing the erased 0x080c8a1a trampoline.
+  4. Check the oracle in test4b.py is not circular (the helper "reference" must derive from stock behaviour, not from the helper).
+  5. State plainly what ELSE could make this fail on real hardware and the single live check that would settle it.
+  Report concrete evidence (addresses, bytes, logs), not speculation.
